@@ -255,7 +255,11 @@ app.post('/api/auth/login', async (c) => {
   if (!valid) {
     return c.json({ error: 'Invalid credentials' }, 401)
   }
-
+  const secret = c.env.JWT_SECRET
+  if (!secret || typeof secret !== 'string' || secret.length < 10) {
+    console.error('JWT_SECRET is invalid or missing')
+    return c.json({ error: 'Server configuration error' }, 500)
+  }
   const payload = {
     sub: user.id,
     username: user.username,
