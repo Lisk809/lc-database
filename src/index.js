@@ -155,7 +155,25 @@ app.use('/api/*', async (c, next) => {
     cookie: false,
   })(c, next)
 })
-
+app.use('/api/*', async (c, next) => {
+  if (c.req.path.startsWith('/api/auth/')) {
+    await next()
+    return
+  }
+  // 调试日志
+  console.log('Auth header:', c.req.header('Authorization'))
+  console.log('JWT_SECRET exists:', !!c.env.JWT_SECRET)
+  try {
+    await jwt({
+      secret: (c) => c.env.JWT_SECRET,
+      alg: 'HS256',
+      cookie: false,
+    })(c, next)
+  } catch (err) {
+    console.error('JWT error:', err)
+    return c.json({ error: 'Unauthorized', details: err.message }, 401)
+  }
+})
 // 4. 限流中间件（基于 userId，公开路径用 'anonymous'）
 app.use('/api/*', async (c, next) => {
   let userId = 'anonymous'
