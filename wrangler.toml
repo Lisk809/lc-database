@@ -1,0 +1,19 @@
+name = "unified-worker"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# D1 数据库绑定（替换为你的实际 database_id）
+[[d1_databases]]
+binding = "DB"
+database_name = "lunacho"
+database_id = "25bc0507-8c83-44b3-936d-eb44829abdec"
+
+# KV 命名空间（用于缓存帖子详情）
+[[kv_namespaces]]
+binding = "POSTS_CACHE"
+id = "f8c7dd08c70046b69eda1ee2eedce3be"
+
+# 环境变量（生产环境建议使用 Secrets 加密）
+[vars]
+MAX_FILE_BYTES = "10485760"                 # 10MB
+ALLOWED_EXTENSIONS = ".csv,.json,.parquet,.pdf,.png,.jpg"

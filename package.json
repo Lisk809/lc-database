@@ -1,0 +1,18 @@
+{
+  "name": "unified-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "migrate": "wrangler d1 migrations apply your-database-name"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "@hono/jwt": "^0.4.0",
+    "@cloudflare/workers-bcrypt": "^0.1.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
