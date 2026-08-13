@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { jwt, sign } from 'hono/jwt'
+import { jwt, sign, verify } from 'hono/jwt'
 import { cors } from 'hono/cors'
 //import { bcrypt } from 'bcryptjs'
 
@@ -142,36 +142,26 @@ app.use('*', async (c, next) => {
   c.res.headers.set('X-Frame-Options', 'DENY')
   c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
 })
+import { verify } from '@hono/jwt'
 
-// 3. JWT 认证中间件（排除 /api/auth/*）
 app.use('/api/*', async (c, next) => {
   if (c.req.path.startsWith('/api/auth/')) {
     await next()
     return
   }
-  return jwt({
-    secret: (c) => c.env.JWT_SECRET,
-    alg: 'HS256',
-    cookie: false,
-  })(c, next)
-})
-app.use('/api/*', async (c, next) => {
-  if (c.req.path.startsWith('/api/auth/')) {
-    await next()
-    return
+  const authHeader = c.req.header('Authorization')
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Missing or invalid Authorization header' }, 401)
   }
-  // 调试日志
-  console.log('Auth header:', c.req.header('Authorization'))
-  console.log('JWT_SECRET exists:', !!c.env.JWT_SECRET)
+  const token = authHeader.slice(7)
   try {
-    await jwt({
-      secret: (c) => c.env.JWT_SECRET,
-      alg: 'HS256',
-      cookie: false,
-    })(c, next)
+    const payload = await verify(token, c.env.JWT_SECRET)
+    c.set('jwtPayload', payload)
+    c.set('userId', payload.sub)
+    await next()
   } catch (err) {
-    console.error('JWT error:', err)
-    return c.json({ error: 'Unauthorized', details: err.message }, 401)
+    console.error('Verify error:', err)
+    return c.json({ error: 'Unauthorized', detail: err.message }, 401)
   }
 })
 // 4. 限流中间件（基于 userId，公开路径用 'anonymous'）
