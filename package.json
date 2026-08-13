@@ -9,8 +9,7 @@
   },
   "dependencies": {
     "hono": "^4.6.0",
-    "@hono/jwt": "^0.4.0",
-    "@cloudflare/workers-bcrypt": "^0.1.0"
+    "bcryptjs": "^2.4.3"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"

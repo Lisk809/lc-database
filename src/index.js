@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { jwt, sign } from '@hono/jwt'
+import { jwt, sign } from 'hono/jwt'
 import { cors } from 'hono/cors'
 import { bcrypt } from '@cloudflare/workers-bcrypt'
 
