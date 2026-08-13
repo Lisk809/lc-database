@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { jwt, sign } from 'hono/jwt'
 import { cors } from 'hono/cors'
-import { bcrypt } from '@cloudflare/workers-bcrypt'
+import { bcrypt } from 'bcryptjs'
 
 // ---------- 全局配置 ----------
 const ALLOWED_MIME_TYPES = new Set([
