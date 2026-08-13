@@ -132,19 +132,21 @@ app.use('/api/*', async (c, next) => {
   c.set('userId', userId)
 
   const limiter = c.env.RATE_LIMITER
-  const { success } = await limiter.limit({
-    key: userId,
-    limit: 20,
-    duration: 60,
-  })
-  if (!success) {
-    return c.json({ error: 'Too Many Requests' }, 429, {
-      'Retry-After': '60'
+  // 如果限流器未绑定，跳过限流（避免报错）
+  if (limiter) {
+    const { success } = await limiter.limit({
+      key: userId,
+      limit: 20,
+      duration: 60,
     })
+    if (!success) {
+      return c.json({ error: 'Too Many Requests' }, 429, {
+        'Retry-After': '60'
+      })
+    }
   }
   await next()
 })
-
 // ---------- 认证路由 ----------
 // 注册
 app.post('/api/auth/register', async (c) => {
