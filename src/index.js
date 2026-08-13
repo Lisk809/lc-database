@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { jwt, sign } from 'hono/jwt'
 import { cors } from 'hono/cors'
-import { bcrypt } from 'bcryptjs'
+//import { bcrypt } from 'bcryptjs'
 
 // ---------- 全局配置 ----------
 const ALLOWED_MIME_TYPES = new Set([
@@ -18,6 +18,40 @@ const ALLOWED_MIME_TYPES = new Set([
 const app = new Hono()
 
 // ---------- 辅助函数 ----------
+// ---------- 密码哈希工具（基于 Web Crypto API） ----------
+async function hashPassword(password, salt) {
+  const encoder = new TextEncoder()
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(password),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveBits']
+  )
+  const hashBuffer = await crypto.subtle.deriveBits(
+    {
+      name: 'PBKDF2',
+      salt: encoder.encode(salt),
+      iterations: 100000,
+      hash: 'SHA-256'
+    },
+    keyMaterial,
+    256
+  )
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+async function generateSalt(length = 16) {
+  const array = new Uint8Array(length)
+  crypto.getRandomValues(array)
+  return Array.from(array).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+async function verifyPassword(password, hash, salt) {
+  const computedHash = await hashPassword(password, salt)
+  return computedHash === hash
+}
 // 计算 MD5（用于 Gravatar）
 async function md5(message) {
   const msgUint8 = new TextEncoder().encode(message)
@@ -170,19 +204,21 @@ app.post('/api/auth/register', async (c) => {
     return c.json({ error: 'Username or email already taken' }, 409)
   }
 
-  const salt = await bcrypt.genSalt(10)
-  const hash = await bcrypt.hash(password, salt)
+  // 生成盐并哈希密码
+  const salt = await generateSalt(16)
+  const hash = await hashPassword(password, salt)
+
   const id = crypto.randomUUID()
   const now = Date.now()
   const stmt = c.env.DB.prepare(
-    `INSERT INTO users (id, username, email, password_hash, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+    `INSERT INTO users (id, username, email, password_hash, salt, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
   )
-  await stmt.bind(id, username, email.trim().toLowerCase(), hash, now, now).run()
+  // 注意：users 表需要增加 salt 列
+  await stmt.bind(id, username, email.trim().toLowerCase(), hash, salt, now, now).run()
 
   return c.json({ message: 'User registered successfully', user_id: id }, 201)
 })
-
 // 登录
 app.post('/api/auth/login', async (c) => {
   const { username, password } = await c.req.json()
@@ -191,13 +227,13 @@ app.post('/api/auth/login', async (c) => {
   }
 
   const user = await c.env.DB.prepare(
-    'SELECT id, username, email, password_hash FROM users WHERE username = ?'
+    'SELECT id, username, email, password_hash, salt FROM users WHERE username = ?'
   ).bind(username).first()
   if (!user) {
     return c.json({ error: 'Invalid credentials' }, 401)
   }
 
-  const valid = await bcrypt.compare(password, user.password_hash)
+  const valid = await verifyPassword(password, user.password_hash, user.salt)
   if (!valid) {
     return c.json({ error: 'Invalid credentials' }, 401)
   }
@@ -205,7 +241,7 @@ app.post('/api/auth/login', async (c) => {
   const payload = {
     sub: user.id,
     username: user.username,
-    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7, // 7天
+    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
   }
   const token = await sign(payload, c.env.JWT_SECRET)
 
