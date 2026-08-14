@@ -154,7 +154,7 @@ app.use('/api/*', async (c, next) => {
   }
   const token = authHeader.slice(7)
   try {
-    const payload = await verify(token, c.env.JWT_SECRET)
+    const payload = await verify(token, c.env.JWT_SECRET,"HS256")
     c.set('jwtPayload', payload)
     c.set('userId', payload.sub)
     await next()
