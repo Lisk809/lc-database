@@ -142,7 +142,6 @@ app.use('*', async (c, next) => {
   c.res.headers.set('X-Frame-Options', 'DENY')
   c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
 })
-import { verify } from '@hono/jwt'
 
 app.use('/api/*', async (c, next) => {
   if (c.req.path.startsWith('/api/auth/')) {
