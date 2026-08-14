@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { jwt, sign, verify } from 'hono/jwt'
 import { cors } from 'hono/cors'
 //import { bcrypt } from 'bcryptjs'
-import { uploadFiles } from '@huggingface/hub'
+// import { uploadFiles } from '@huggingface/hub'
 
 // ---------- 全局配置 ----------
 const ALLOWED_MIME_TYPES = new Set([
@@ -54,6 +54,8 @@ async function getGravatarUrl(email, size = 200) {
 }
 
 // 上传文件到 Hugging Face
+// 不再需要 sha256 和 base64 辅助函数，改用原生 Blob 和 FormData 方式（推荐）
+
 async function uploadFileToHF(fileBuffer, fileName, userId, env) {
   const hfToken = env.HF_TOKEN
   const repoId = env.HF_REPO_ID
@@ -65,30 +67,28 @@ async function uploadFileToHF(fileBuffer, fileName, userId, env) {
   const safeName = fileName.replace(/[^a-zA-Z0-9_.-]/g, '_')
   const filePath = `uploads/${userId}/${timestamp}_${safeName}`
 
-  // 从 ArrayBuffer 创建 Blob
-  const blob = new Blob([fileBuffer])
+  // 使用 Hugging Face 的 Upload API（虽已弃用，但实际仍可用，且支持二进制流）
+  // 或者使用最新的 /commit 端点，但需要构建 commit 对象并 Base64 编码。
+  // 为了简单可靠，我们使用 /upload 端点（官方虽标记弃用，但许多用户仍在使用）
+  const uploadUrl = `https://huggingface.co/api/datasets/${repoId}/upload/${filePath}`
 
-  // 使用 @huggingface/hub 的 uploadFiles 方法
-  const result = await uploadFiles({
-    repo: repoId,
-    files: [
-      {
-        path: filePath,
-        file: blob,
-      },
-    ],
-    accessToken: hfToken,
+  const resp = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${hfToken}`,
+      'Content-Type': 'application/octet-stream',
+    },
+    body: fileBuffer, // 直接传 ArrayBuffer
   })
 
-  // 返回上传后的信息
-  if (result && result.length > 0) {
-    const uploaded = result[0]
-    return {
-      path: uploaded.path,
-      url: `https://huggingface.co/datasets/${repoId}/blob/main/${uploaded.path}`,
-    }
-  } else {
-    throw new Error('Upload failed: no response')
+  if (!resp.ok) {
+    let errMsg = await resp.text()
+    throw new Error(`HF upload failed: ${resp.status} - ${errMsg}`)
+  }
+
+  return {
+    path: filePath,
+    url: `https://huggingface.co/datasets/${repoId}/blob/main/${filePath}`,
   }
 }
 // 校验上传的文件

@@ -9,8 +9,7 @@
   },
   "dependencies": {
     "hono": "^4.6.0",
-    "bcryptjs": "^2.4.3",
-    "@huggingface/hub": "^2.15.0"
+    "bcryptjs": "^2.4.3"
   },
   "devDependencies": {
     "wrangler": "^4.123.0"
