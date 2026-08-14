@@ -3,7 +3,7 @@ import { jwt, sign, verify } from 'hono/jwt'
 import { cors } from 'hono/cors'
 //import { bcrypt } from 'bcryptjs'
 // import { uploadFiles } from '@huggingface/hub'
-import HuggingFaceAPI from './huggingfaceAPI.js'
+import {HuggingFaceAPI} from './huggingfaceAPI.js'
 
 // ---------- 全局配置 ----------
 const ALLOWED_MIME_TYPES = new Set([
