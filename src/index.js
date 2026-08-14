@@ -41,7 +41,22 @@ async function hashPassword(password, salt) {
   const hashArray = Array.from(new Uint8Array(hashBuffer))
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
 }
+// ---------- 工具函数：计算 SHA256 ----------
+async function sha256(buffer) {
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer)
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+}
 
+// ---------- 工具函数：ArrayBuffer 转 Base64 ----------
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  return btoa(binary)
+}
 async function generateSalt(length = 16) {
   const array = new Uint8Array(length)
   crypto.getRandomValues(array)
@@ -78,29 +93,52 @@ async function uploadFileToHF(fileBuffer, fileName, userId, env) {
 
   const timestamp = Date.now()
   const safeName = fileName.replace(/[^a-zA-Z0-9_.-]/g, '_')
-  const uploadPath = `uploads/${userId}/${timestamp}_${safeName}`
-  const uploadUrl = `https://huggingface.co/api/datasets/${repoId}/upload/${uploadPath}`
+  const filePath = `uploads/${userId}/${timestamp}_${safeName}`
 
-  const resp = await fetch(uploadUrl, {
+  // 计算 SHA256 和 Base64
+  const sha = await sha256(fileBuffer)
+  const base64Content = arrayBufferToBase64(fileBuffer)
+  const size = fileBuffer.byteLength
+
+  // 构建 Commit API 请求体
+  const commitPayload = {
+    summary: `Upload ${safeName}`,
+    description: `Uploaded by user ${userId}`,
+    commits: [
+      {
+        path: filePath,
+        title: `Add ${safeName}`,
+        file: {
+          content: base64Content,
+          encoding: 'base64',
+          size: size,
+          sha256: sha,
+        },
+      },
+    ],
+  }
+
+  const commitUrl = `https://huggingface.co/api/datasets/${repoId}/commit`
+  const resp = await fetch(commitUrl, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${hfToken}`,
-      'Content-Type': 'application/octet-stream',
+      'Content-Type': 'application/json',
     },
-    body: fileBuffer,
+    body: JSON.stringify(commitPayload),
   })
 
   if (!resp.ok) {
     const errText = await resp.text()
-    throw new Error(`HF upload failed: ${resp.status} - ${errText}`)
+    throw new Error(`HF commit failed: ${resp.status} - ${errText}`)
   }
-  const result = await resp.json()
+
+  // 返回文件 URL
   return {
-    path: uploadPath,
-    url: `https://huggingface.co/datasets/${repoId}/blob/main/${uploadPath}`,
+    path: filePath,
+    url: `https://huggingface.co/datasets/${repoId}/blob/main/${filePath}`,
   }
 }
-
 // 校验上传的文件
 async function validateUploadedFile(file, env) {
   if (!file || !(file instanceof File)) return null
