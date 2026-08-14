@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { jwt, sign, verify } from 'hono/jwt'
 import { cors } from 'hono/cors'
 //import { bcrypt } from 'bcryptjs'
+import { uploadFiles } from '@huggingface/hub'
 
 // ---------- 全局配置 ----------
 const ALLOWED_MIME_TYPES = new Set([
@@ -16,37 +17,6 @@ const ALLOWED_MIME_TYPES = new Set([
 
 // ---------- 创建 Hono 应用 ----------
 const app = new Hono()
-
-// ---------- 辅助函数 ----------
-// ---------- 密码哈希工具（基于 Web Crypto API） ----------
-async function hashPassword(password, salt) {
-  const encoder = new TextEncoder()
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(password),
-    { name: 'PBKDF2' },
-    false,
-    ['deriveBits']
-  )
-  const hashBuffer = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt: encoder.encode(salt),
-      iterations: 100000,
-      hash: 'SHA-256'
-    },
-    keyMaterial,
-    256
-  )
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
-}
-// ---------- 工具函数：计算 SHA256 ----------
-async function sha256(buffer) {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer)
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
-}
 
 // ---------- 工具函数：ArrayBuffer 转 Base64 ----------
 function arrayBufferToBase64(buffer) {
@@ -95,48 +65,30 @@ async function uploadFileToHF(fileBuffer, fileName, userId, env) {
   const safeName = fileName.replace(/[^a-zA-Z0-9_.-]/g, '_')
   const filePath = `uploads/${userId}/${timestamp}_${safeName}`
 
-  // 计算 SHA256 和 Base64
-  const sha = await sha256(fileBuffer)
-  const base64Content = arrayBufferToBase64(fileBuffer)
-  const size = fileBuffer.byteLength
+  // 从 ArrayBuffer 创建 Blob
+  const blob = new Blob([fileBuffer])
 
-  // 构建 Commit API 请求体
-  const commitPayload = {
-    summary: `Upload ${safeName}`,
-    description: `Uploaded by user ${userId}`,
-    commits: [
+  // 使用 @huggingface/hub 的 uploadFiles 方法
+  const result = await uploadFiles({
+    repo: repoId,
+    files: [
       {
         path: filePath,
-        title: `Add ${safeName}`,
-        file: {
-          content: base64Content,
-          encoding: 'base64',
-          size: size,
-          sha256: sha,
-        },
+        file: blob,
       },
     ],
-  }
-
-  const commitUrl = `https://huggingface.co/api/datasets/${repoId}/commit`
-  const resp = await fetch(commitUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${hfToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(commitPayload),
+    accessToken: hfToken,
   })
 
-  if (!resp.ok) {
-    const errText = await resp.text()
-    throw new Error(`HF commit failed: ${resp.status} - ${errText}`)
-  }
-
-  // 返回文件 URL
-  return {
-    path: filePath,
-    url: `https://huggingface.co/datasets/${repoId}/blob/main/${filePath}`,
+  // 返回上传后的信息
+  if (result && result.length > 0) {
+    const uploaded = result[0]
+    return {
+      path: uploaded.path,
+      url: `https://huggingface.co/datasets/${repoId}/blob/main/${uploaded.path}`,
+    }
+  } else {
+    throw new Error('Upload failed: no response')
   }
 }
 // 校验上传的文件
