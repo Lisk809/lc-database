@@ -82,7 +82,28 @@ async function getGravatarUrl(email, size = 200) {
   const hash = await md5(normalized)
   return `https://www.gravatar.com/avatar/${hash}?s=${size}&d=identicon`
 }
-
+async function saveFileRecord(userId, fileInfo, env) {
+  // fileInfo: { fileName, filePath, fileUrl, fileSize, mimeType, sha256 }
+  const id = crypto.randomUUID()
+  const now = Date.now()
+  const stmt = env.DB.prepare(
+    `INSERT INTO files (id, user_id, file_name, file_path, file_url, file_size, mime_type, sha256, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  await stmt.bind(
+    id,
+    userId,
+    fileInfo.fileName,
+    fileInfo.filePath,
+    fileInfo.fileUrl,
+    fileInfo.fileSize,
+    fileInfo.mimeType || null,
+    fileInfo.sha256 || null,
+    now,
+    now
+  ).run()
+  return id
+}
 // 上传文件到 Hugging Face
 // 不再需要 sha256 和 base64 辅助函数，改用原生 Blob 和 FormData 方式（推荐）
 
@@ -125,8 +146,13 @@ async function uploadFileToHF(fileBuffer, fileName, userId, env) {
   return {
     path: result.filePath,
     url: result.fileUrl,
+    fileName: safeName,
+    fileSize: fileBuffer.byteLength,
+    sha256: result.oid || null,
+    mimeType: blob.type || 'application/octet-stream'
   }
 }
+
 // 校验上传的文件
 async function validateUploadedFile(file, env) {
   if (!file || !(file instanceof File)) return null
@@ -388,7 +414,27 @@ app.get('/api/me/questions', async (c) => {
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
 })
+app.get('/api/me/files', async (c) => {
+  const userId = c.get('userId')
+  const page = parseInt(c.req.query('page') || '1')
+  const limit = Math.min(parseInt(c.req.query('limit') || '20'), 100)
+  const offset = (page - 1) * limit
 
+  const stmt = c.env.DB.prepare(
+    `SELECT id, file_name, file_path, file_url, file_size, mime_type, created_at
+     FROM files WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  )
+  const rows = await stmt.bind(userId, limit, offset).all()
+  const totalStmt = c.env.DB.prepare(
+    'SELECT COUNT(*) as total FROM files WHERE user_id = ?'
+  )
+  const total = (await totalStmt.bind(userId).first()).total
+
+  return c.json({
+    data: rows.results || [],
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+  })
+})
 // ---------- 帖子路由 ----------
 // 帖子详情（带缓存）
 app.get('/api/posts/:id', async (c) => {
@@ -620,6 +666,8 @@ app.get('/api/questions', async (c) => {
 // ---------- 通用文件上传 ----------
 app.post('/api/upload', async (c) => {
   const userId = c.get('userId')
+
+  // 1. 解析请求，获取文件
   const contentType = c.req.header('Content-Type') || ''
   let fileBuffer, fileName, mimeType
 
@@ -640,32 +688,47 @@ app.post('/api/upload', async (c) => {
   }
 
   try {
-    const ext = '.' + fileName.split('.').pop().toLowerCase()
-    const maxBytes = parseInt(c.env.MAX_FILE_BYTES || '10485760')
+    // 2. 校验文件
+    const maxBytes = parseInt(c.env.MAX_FILE_BYTES || '10485760') // 默认10MB
     if (fileBuffer.byteLength > maxBytes) {
       throw new Error(`File too large (max ${maxBytes} bytes)`)
     }
+
+    const ext = '.' + fileName.split('.').pop().toLowerCase()
     const allowedExts = (c.env.ALLOWED_EXTENSIONS || '')
       .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
     if (allowedExts.length && !allowedExts.includes(ext)) {
       throw new Error(`Extension not allowed. Allowed: ${allowedExts.join(', ')}`)
     }
-    if (!ALLOWED_MIME_TYPES.has(mimeType) && !allowedExts.includes(ext)) {
-      throw new Error(`MIME type "${mimeType}" not allowed`)
-    }
 
+    // 3. 上传到 Hugging Face (自动处理 LFS)
     const uploadResult = await uploadFileToHF(fileBuffer, fileName, userId, c.env)
+
+    // 4. 保存文件元数据到 D1
+    const fileId = await saveFileRecord(userId, {
+      fileName: uploadResult.fileName,
+      filePath: uploadResult.path,
+      fileUrl: uploadResult.url,
+      fileSize: uploadResult.fileSize,
+      sha256: uploadResult.sha256,
+      mimeType: uploadResult.mimeType,
+    }, c.env)
+
+    // 5. 返回成功响应
     return c.json({
       success: true,
+      fileId,
       path: uploadResult.path,
       url: uploadResult.url,
-      size: fileBuffer.byteLength,
-    })
+      size: uploadResult.fileSize,
+      fileName: uploadResult.fileName,
+    }, 201)
+
   } catch (err) {
+    console.error('Upload error:', err.message)
     return c.json({ error: err.message }, 400)
   }
 })
-
 // ---------- 全局错误处理 ----------
 app.onError((err, c) => {
   console.error('Unhandled error:', err)
