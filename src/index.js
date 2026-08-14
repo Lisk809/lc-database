@@ -74,7 +74,17 @@ async function md5(message) {
   const hashArray = Array.from(new Uint8Array(hashBuffer))
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
 }
-
+// ---------- 徽章授予（示例：根据条件自动授予，这里简单实现） ----------
+async function awardBadgeIfNotExists(userId, badgeId, env) {
+  const existing = await env.DB.prepare(
+    'SELECT 1 FROM user_badges WHERE user_id = ? AND badge_id = ?'
+  ).bind(userId, badgeId).first();
+  if (existing) return;
+  const now = Date.now();
+  await env.DB.prepare(
+    'INSERT INTO user_badges (user_id, badge_id, awarded_at) VALUES (?, ?, ?)'
+  ).bind(userId, badgeId, now).run();
+}
 // 生成 Gravatar URL
 async function getGravatarUrl(email, size = 200) {
   if (!email) return null
@@ -321,18 +331,22 @@ app.post('/api/auth/login', async (c) => {
 // ---------- 个人主页路由 ----------
 // 获取当前用户信息（含 Gravatar）
 app.get('/api/me', async (c) => {
-  const userId = c.get('userId')
+  const userId = c.get('userId');
   const user = await c.env.DB.prepare(
     'SELECT id, username, email, avatar_url, bio, created_at FROM users WHERE id = ?'
-  ).bind(userId).first()
-  if (!user) {
-    return c.json({ error: 'User not found' }, 404)
-  }
+  ).bind(userId).first();
+  if (!user) return c.json({ error: 'User not found' }, 404);
 
-  let avatar = user.avatar_url
-  if (!avatar && user.email) {
-    avatar = await getGravatarUrl(user.email)
-  }
+  // 获取用户徽章
+  const badges = await c.env.DB.prepare(
+    `SELECT b.id, b.name, b.description, b.icon_url, ub.awarded_at
+     FROM user_badges ub
+     JOIN badges b ON ub.badge_id = b.id
+     WHERE ub.user_id = ? ORDER BY ub.awarded_at DESC`
+  ).bind(userId).all();
+
+  let avatar = user.avatar_url;
+  if (!avatar && user.email) avatar = await getGravatarUrl(user.email);
 
   return c.json({
     id: user.id,
@@ -340,9 +354,9 @@ app.get('/api/me', async (c) => {
     avatar: avatar || null,
     bio: user.bio || '',
     created_at: user.created_at,
-  })
-})
-
+    badges: badges.results || [],
+  });
+});
 // 更新个人信息（bio / avatar_url）
 app.patch('/api/me', async (c) => {
   const userId = c.get('userId')
@@ -436,6 +450,50 @@ app.get('/api/me/files', async (c) => {
   })
 })
 // ---------- 帖子路由 ----------
+// ---------- 公告 ----------
+// 获取公告列表（分页）
+app.get('/api/announcements', async (c) => {
+  const page = parseInt(c.req.query('page') || '1');
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50);
+  const offset = (page - 1) * limit;
+
+  const stmt = c.env.DB.prepare(
+    `SELECT id, title, content, author_id, created_at
+     FROM announcements ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  );
+  const rows = await stmt.bind(limit, offset).all();
+  const totalStmt = c.env.DB.prepare('SELECT COUNT(*) as total FROM announcements');
+  const total = (await totalStmt.first()).total;
+
+  return c.json({
+    data: rows.results || [],
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+  });
+});
+
+// 发布公告（仅管理员）
+app.post('/api/announcements', async (c) => {
+  const userId = c.get('userId');
+  // 检查管理员权限：这里简单用环境变量 ADMIN_USER_IDS 逗号分隔
+  const adminIds = (c.env.ADMIN_USER_IDS || '').split(',').map(s => s.trim());
+  if (!adminIds.includes(userId)) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const { title, content } = await c.req.json();
+  if (!title || !content) {
+    return c.json({ error: 'Title and content required' }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  await c.env.DB.prepare(
+    `INSERT INTO announcements (id, title, content, author_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(id, title, content, userId, now, now).run();
+
+  return c.json({ id, title, content, created_at: now }, 201);
+});
 // 帖子详情（带缓存）
 app.get('/api/posts/:id', async (c) => {
   const postId = c.req.param('id')
@@ -508,7 +566,45 @@ app.get('/api/posts/:id/replies', async (c) => {
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
 })
+// ---------- 帖子点赞 ----------
+app.post('/api/posts/:id/like', async (c) => {
+  const postId = c.req.param('id');
+  const userId = c.get('userId');
+  const now = Date.now();
 
+  // 检查帖子是否存在
+  const post = await c.env.DB.prepare('SELECT id FROM posts WHERE id = ?').bind(postId).first();
+  if (!post) return c.json({ error: 'Post not found' }, 404);
+
+  // 检查是否已点赞
+  const existing = await c.env.DB.prepare(
+    'SELECT 1 FROM post_likes WHERE user_id = ? AND post_id = ?'
+  ).bind(userId, postId).first();
+
+  if (existing) {
+    // 取消点赞（删除记录，减少计数）
+    await c.env.DB.prepare('DELETE FROM post_likes WHERE user_id = ? AND post_id = ?')
+      .bind(userId, postId).run();
+    await c.env.DB.prepare('UPDATE posts SET likes_count = likes_count - 1 WHERE id = ?')
+      .bind(postId).run();
+    return c.json({ liked: false, likes_count: await getLikesCount(postId, c.env) });
+  } else {
+    // 添加点赞
+    await c.env.DB.prepare(
+      'INSERT INTO post_likes (user_id, post_id, created_at) VALUES (?, ?, ?)'
+    ).bind(userId, postId, now).run();
+    await c.env.DB.prepare('UPDATE posts SET likes_count = likes_count + 1 WHERE id = ?')
+      .bind(postId).run();
+    return c.json({ liked: true, likes_count: await getLikesCount(postId, c.env) });
+  }
+});
+
+// 辅助：获取点赞数（可复用）
+async function getLikesCount(postId, env) {
+  const result = await env.DB.prepare('SELECT likes_count FROM posts WHERE id = ?')
+    .bind(postId).first();
+  return result ? result.likes_count : 0;
+}
 // 创建帖子（支持附件）
 app.post('/api/posts', async (c) => {
   const userId = c.get('userId')
