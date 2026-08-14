@@ -3,6 +3,7 @@ import { jwt, sign, verify } from 'hono/jwt'
 import { cors } from 'hono/cors'
 //import { bcrypt } from 'bcryptjs'
 // import { uploadFiles } from '@huggingface/hub'
+import HuggingFaceAPI from './huggingfaceAPI.js'
 
 // ---------- 全局配置 ----------
 const ALLOWED_MIME_TYPES = new Set([
@@ -85,6 +86,7 @@ async function getGravatarUrl(email, size = 200) {
 // 上传文件到 Hugging Face
 // 不再需要 sha256 和 base64 辅助函数，改用原生 Blob 和 FormData 方式（推荐）
 
+// ---------- 上传到 Hugging Face（使用 LFS 协议） ----------
 async function uploadFileToHF(fileBuffer, fileName, userId, env) {
   const hfToken = env.HF_TOKEN
   const repoId = env.HF_REPO_ID
@@ -92,32 +94,37 @@ async function uploadFileToHF(fileBuffer, fileName, userId, env) {
     throw new Error('Hugging Face credentials not configured')
   }
 
+  // 文件大小限制（建议设为 50MB，但 Workers 内存可能受限，可调整为 10MB）
+  const maxBytes = parseInt(env.MAX_FILE_BYTES || '10485760') // 默认 10MB
+  if (fileBuffer.byteLength > maxBytes) {
+    throw new Error(`File too large: ${fileBuffer.byteLength} bytes (max ${maxBytes} bytes)`)
+  }
+
   const timestamp = Date.now()
   const safeName = fileName.replace(/[^a-zA-Z0-9_.-]/g, '_')
   const filePath = `uploads/${userId}/${timestamp}_${safeName}`
 
-  // 使用 Hugging Face 的 Upload API（虽已弃用，但实际仍可用，且支持二进制流）
-  // 或者使用最新的 /commit 端点，但需要构建 commit 对象并 Base64 编码。
-  // 为了简单可靠，我们使用 /upload 端点（官方虽标记弃用，但许多用户仍在使用）
-  const uploadUrl = `https://huggingface.co/api/datasets/${repoId}/upload/${filePath}`
+  // 将 ArrayBuffer 转换为 Blob（HuggingFaceAPI 需要）
+  const blob = new Blob([fileBuffer])
 
-  const resp = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${hfToken}`,
-      'Content-Type': 'application/octet-stream',
-    },
-    body: fileBuffer, // 直接传 ArrayBuffer
-  })
+  // 创建 API 实例
+  const api = new HuggingFaceAPI(hfToken, repoId, false) // 默认为公开仓库
 
-  if (!resp.ok) {
-    let errMsg = await resp.text()
-    throw new Error(`HF upload failed: ${resp.status} - ${errMsg}`)
+  // 上传文件（自动处理 LFS 或直接提交）
+  const result = await api.uploadFile(
+    blob,
+    filePath,
+    `Upload ${safeName}`
+    // 不传入预计算 SHA256，让 API 内部计算（小文件没问题）
+  )
+
+  if (!result.success) {
+    throw new Error('Upload failed: ' + JSON.stringify(result))
   }
 
   return {
-    path: filePath,
-    url: `https://huggingface.co/datasets/${repoId}/blob/main/${filePath}`,
+    path: result.filePath,
+    url: result.fileUrl,
   }
 }
 // 校验上传的文件
