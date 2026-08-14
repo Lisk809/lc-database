@@ -161,7 +161,7 @@ app.use('/api/*', async (c, next) => {
     await next()
   } catch (err) {
     console.error('Verify error:', err)
-    return c.json({ error: 'Unauthorized', detail: err.message }, 401)
+    return c.json({ error: 'Unauthorized', detail: err.message, token }, 401)
   }
 })
 // 4. 限流中间件（基于 userId，公开路径用 'anonymous'）
