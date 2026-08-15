@@ -489,15 +489,18 @@ app.get('/api/announcements', async (c) => {
   const offset = (page - 1) * limit;
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, author_id, created_at / 1000 AS created_at
-     FROM announcements ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    `SELECT a.id, a.title, a.content, a.author_id, a.created_at / 1000 AS created_at,
+            u.username AS author_username, u.avatar_url AS author_avatar_url
+     FROM announcements a
+     LEFT JOIN users u ON u.id = a.author_id
+     ORDER BY a.created_at DESC LIMIT ? OFFSET ?`
   );
   const rows = await stmt.bind(limit, offset).all();
   const totalStmt = c.env.DB.prepare('SELECT COUNT(*) as total FROM announcements');
   const total = (await totalStmt.first()).total;
 
   return c.json({
-    data: rows.results || [],
+    data: (rows.results || []).map((row) => withAuthor(row, 'author_id')),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   });
 });
@@ -523,7 +526,8 @@ app.post('/api/announcements', async (c) => {
      VALUES (?, ?, ?, ?, ?, ?)`
   ).bind(id, title, content, userId, now, now).run();
 
-  return c.json({ id, title, content, created_at: Math.floor(now / 1000) }, 201);
+  const author = await fetchAuthor(c.env, userId);
+  return c.json({ id, title, content, author, created_at: Math.floor(now / 1000) }, 201);
 });
 // 帖子详情（带缓存）
 app.get('/api/posts/:id', async (c) => {
@@ -541,7 +545,7 @@ app.get('/api/posts/:id', async (c) => {
 
   // 2. KV
   const kv = c.env.POSTS_CACHE
-  const kvKey = `post:v2:${postId}` // v2：详情补上 likes_count、时间戳改为秒（旧缓存键作废）
+  const kvKey = `post:v3:${postId}` // v3：详情带上 author 作者信息（旧缓存键作废）
   let kvData = await kv.get(kvKey, 'json')
   if (kvData) {
     const resp = c.json(kvData)
@@ -551,21 +555,28 @@ app.get('/api/posts/:id', async (c) => {
 
   // 3. D1
   const stmt = c.env.DB.prepare(
-    'SELECT id, title, content, user_id, reply_count, likes_count, attachment_url, created_at / 1000 AS created_at FROM posts WHERE id = ?'
+    `SELECT p.id, p.title, p.content, p.user_id, p.reply_count, p.likes_count, p.attachment_url,
+            p.created_at / 1000 AS created_at,
+            u.username AS author_username, u.avatar_url AS author_avatar_url
+     FROM posts p
+     LEFT JOIN users u ON u.id = p.user_id
+     WHERE p.id = ?`
   )
   const post = await stmt.bind(postId).first()
   if (!post) {
     return c.json({ error: 'Post not found' }, 404)
   }
 
+  const body = withAuthor(post)
+
   // 异步回填缓存
   c.executionCtx.waitUntil((async () => {
-    await kv.put(kvKey, JSON.stringify(post), { expirationTtl: 3600 })
-    const resp = c.json(post)
+    await kv.put(kvKey, JSON.stringify(body), { expirationTtl: 3600 })
+    const resp = c.json(body)
     await cache.put(cacheKey, resp.clone())
   })())
 
-  return c.json(post)
+  return c.json(body)
 })
 
 // 帖子回复列表（分页）
@@ -580,10 +591,12 @@ app.get('/api/posts/:id/replies', async (c) => {
   }
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, content, user_id, attachment_url, created_at / 1000 AS created_at
-     FROM replies
-     WHERE post_id = ? AND status = 'active'
-     ORDER BY created_at DESC
+    `SELECT r.id, r.content, r.user_id, r.attachment_url, r.created_at / 1000 AS created_at,
+            u.username AS author_username, u.avatar_url AS author_avatar_url
+     FROM replies r
+     LEFT JOIN users u ON u.id = r.user_id
+     WHERE r.post_id = ? AND r.status = 'active'
+     ORDER BY r.created_at DESC
      LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(postId, limit, offset).all()
@@ -593,7 +606,7 @@ app.get('/api/posts/:id/replies', async (c) => {
   const total = (await totalStmt.bind(postId).first()).total
 
   return c.json({
-    data: rows.results || [],
+    data: (rows.results || []).map((row) => withAuthor(row)),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
 })
@@ -637,9 +650,29 @@ async function getLikesCount(postId, env) {
     .bind(postId).first();
   return result ? result.likes_count : 0;
 }
+
+// 辅助：把联表查出的作者字段（author_username / author_avatar_url）组装成 author 对象
+// LEFT JOIN 查不到用户时返回 null（如用户已删除）
+function withAuthor(row, idField = 'user_id') {
+  const { author_username, author_avatar_url, ...rest } = row
+  return {
+    ...rest,
+    author: author_username
+      ? { id: row[idField], username: author_username, avatar_url: author_avatar_url || null }
+      : null,
+  }
+}
+
+// 辅助：按 id 取用户，供创建接口返回作者信息
+async function fetchAuthor(env, userId) {
+  const user = await env.DB.prepare(
+    'SELECT username, avatar_url FROM users WHERE id = ?'
+  ).bind(userId).first()
+  return user ? { id: userId, username: user.username, avatar_url: user.avatar_url || null } : null
+}
 // 辅助：帖子详情缓存失效（点赞数/回复数变化后调用；KV 键见 GET /api/posts/:id）
 async function invalidatePostCache(postId, c) {
-  await c.env.POSTS_CACHE.delete(`post:v2:${postId}`);
+  await c.env.POSTS_CACHE.delete(`post:v3:${postId}`);
   const detailUrl = new URL(c.req.url);
   detailUrl.pathname = `/api/posts/${postId}`;
   c.executionCtx.waitUntil(caches.default.delete(detailUrl.toString()));
@@ -657,7 +690,7 @@ app.get('/api/posts', async (c) => {
   const params = []
   let whereClause = ''
   if (userId) {
-    whereClause = 'WHERE user_id = ?'
+    whereClause = 'WHERE p.user_id = ?'
     params.push(userId)
   }
 
@@ -667,10 +700,13 @@ app.get('/api/posts', async (c) => {
   const safeOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC'
 
   const sql = `
-    SELECT id, title, content, user_id, reply_count, likes_count, attachment_url, created_at / 1000 AS created_at
-    FROM posts
+    SELECT p.id, p.title, p.content, p.user_id, p.reply_count, p.likes_count, p.attachment_url,
+           p.created_at / 1000 AS created_at,
+           u.username AS author_username, u.avatar_url AS author_avatar_url
+    FROM posts p
+    LEFT JOIN users u ON u.id = p.user_id
     ${whereClause}
-    ORDER BY ${safeSort} ${safeOrder}
+    ORDER BY p.${safeSort} ${safeOrder}
     LIMIT ? OFFSET ?
   `
   params.push(limit, offset)
@@ -682,7 +718,7 @@ app.get('/api/posts', async (c) => {
   // 查询总数
   const countSql = `
     SELECT COUNT(*) as total
-    FROM posts
+    FROM posts p
     ${whereClause}
   `
   const countParams = userId ? [userId] : []
@@ -698,7 +734,7 @@ app.get('/api/posts', async (c) => {
   if (cached) return cached
 
   const response = c.json({
-    data: rows.results || [],
+    data: (rows.results || []).map((row) => withAuthor(row)),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
   response.headers.set('Cache-Control', 'public, max-age=30, s-maxage=30, stale-while-revalidate=30')
@@ -736,11 +772,13 @@ app.post('/api/posts', async (c) => {
   )
   await stmt.bind(id, title, content, userId, attachmentUrl, now, now).run()
 
+  const author = await fetchAuthor(c.env, userId)
   return c.json({
     id,
     title,
     content,
     user_id: userId,
+    author,
     attachment_url: attachmentUrl,
     created_at: Math.floor(now / 1000),
   }, 201)
@@ -786,11 +824,13 @@ app.post('/api/posts/:id/replies', async (c) => {
   // 回复数已变化：详情缓存失效
   await invalidatePostCache(postId, c)
 
+  const author = await fetchAuthor(c.env, userId)
   return c.json({
     id,
     content,
     user_id: userId,
     post_id: postId,
+    author,
     attachment_url: attachmentUrl,
     created_at: Math.floor(now / 1000),
   }, 201)
@@ -830,6 +870,7 @@ app.post('/api/questions', async (c) => {
   )
   await stmt.bind(id, title, content, options, answer, userId, attachmentUrl, now, now).run()
 
+  const author = await fetchAuthor(c.env, userId)
   return c.json({
     id,
     title,
@@ -837,6 +878,7 @@ app.post('/api/questions', async (c) => {
     options: JSON.parse(options),
     answer,
     user_id: userId,
+    author,
     attachment_url: attachmentUrl,
     created_at: Math.floor(now / 1000),
   }, 201)
@@ -849,15 +891,19 @@ app.get('/api/questions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, options, answer, user_id, attachment_url, created_at / 1000 AS created_at
-     FROM questions ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    `SELECT q.id, q.title, q.content, q.options, q.answer, q.user_id, q.attachment_url,
+            q.created_at / 1000 AS created_at,
+            u.username AS author_username, u.avatar_url AS author_avatar_url
+     FROM questions q
+     LEFT JOIN users u ON u.id = q.user_id
+     ORDER BY q.created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(limit, offset).all()
   const totalStmt = c.env.DB.prepare('SELECT COUNT(*) as total FROM questions')
   const total = (await totalStmt.first()).total
 
   return c.json({
-    data: rows.results || [],
+    data: (rows.results || []).map((row) => withAuthor(row)),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
 })
