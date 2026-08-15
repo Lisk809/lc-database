@@ -605,6 +605,67 @@ async function getLikesCount(postId, env) {
     .bind(postId).first();
   return result ? result.likes_count : 0;
 }
+// ---------- 帖子列表（分页、排序、筛选） ----------
+app.get('/api/posts', async (c) => {
+  const page = parseInt(c.req.query('page') || '1')
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50)
+  const offset = (page - 1) * limit
+  const userId = c.req.query('userId') || null   // 可选：按用户筛选
+  const sortBy = c.req.query('sortBy') || 'created_at' // created_at, likes_count, reply_count
+  const order = c.req.query('order') || 'DESC'   // DESC 或 ASC
+
+  // 构建查询参数
+  const params = []
+  let whereClause = ''
+  if (userId) {
+    whereClause = 'WHERE user_id = ?'
+    params.push(userId)
+  }
+
+  // 允许的排序字段（防止注入）
+  const allowedSortFields = ['created_at', 'likes_count', 'reply_count', 'updated_at']
+  const safeSort = allowedSortFields.includes(sortBy) ? sortBy : 'created_at'
+  const safeOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC'
+
+  const sql = `
+    SELECT id, title, content, user_id, reply_count, likes_count, attachment_url, created_at
+    FROM posts
+    ${whereClause}
+    ORDER BY ${safeSort} ${safeOrder}
+    LIMIT ? OFFSET ?
+  `
+  params.push(limit, offset)
+
+  // 查询数据
+  const stmt = c.env.DB.prepare(sql)
+  const rows = await stmt.bind(...params).all()
+
+  // 查询总数
+  const countSql = `
+    SELECT COUNT(*) as total
+    FROM posts
+    ${whereClause}
+  `
+  const countParams = userId ? [userId] : []
+  const totalStmt = c.env.DB.prepare(countSql)
+  const totalResult = await totalStmt.bind(...countParams).first()
+  const total = totalResult ? totalResult.total : 0
+
+  // 缓存策略：列表缓存 30 秒（可选的，因为分页参数多样，这里简单不缓存，或使用 Cache API）
+  // 我们使用 Cache API 缓存 30 秒，但注意查询参数不同会导致多个缓存项
+  const cacheKey = new Request(c.req.url, c.req.raw)
+  const cache = caches.default
+  let cached = await cache.match(cacheKey)
+  if (cached) return cached
+
+  const response = c.json({
+    data: rows.results || [],
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+  })
+  response.headers.set('Cache-Control', 'public, max-age=30, s-maxage=30, stale-while-revalidate=30')
+  c.executionCtx.waitUntil(cache.put(cacheKey, response.clone()))
+  return response
+})
 // 创建帖子（支持附件）
 app.post('/api/posts', async (c) => {
   const userId = c.get('userId')
