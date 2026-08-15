@@ -73,6 +73,15 @@ async function verifyPassword(password, hash, salt) {
 function getAdminIds(env) {
   return (env.ADMIN_USER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean)
 }
+// 管理员权限校验：无权限时已回 403 并返回 false，调用处直接 return
+function requireAdmin(c) {
+  const userId = c.get('userId')
+  if (!getAdminIds(c.env).includes(userId)) {
+    c.json({ error: 'Forbidden' }, 403)
+    return false
+  }
+  return true
+}
 // ---------- Turnstile 人机验证 ----------
 async function verifyTurnstile(token, secret) {
   const body = new FormData()
@@ -253,7 +262,8 @@ app.use('/api/*', async (c, next) => {
 
   const limiter = c.env.RATE_LIMITER
   // 如果限流器未绑定，跳过限流（避免报错）
-  if (limiter) {
+  // 管理员豁免：批改工作台连续翻队列、打分会快速超过 20 次/分钟
+  if (limiter && !getAdminIds(c.env).includes(userId)) {
     const { success } = await limiter.limit({
       key: userId,
       limit: 20,
@@ -900,6 +910,364 @@ app.get('/api/questions', async (c) => {
   return c.json({
     data: await Promise.all((rows.results || []).map((row) => withAuthor(row))),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+  })
+})
+
+// ---------- 提交与批改路由（在线批改与学情分析系统） ----------
+// 提交答案（文本 Markdown 和/或 PDF 答卷附件；重交 = 覆盖内容/附件、状态打回 pending、旧批改作废）
+app.post('/api/questions/:id/submit', async (c) => {
+  const userId = c.get('userId')
+  const questionId = c.req.param('id')
+  if (!/^[0-9a-f-]{36}$/.test(questionId)) {
+    return c.json({ error: 'Invalid question ID format' }, 400)
+  }
+
+  const question = await c.env.DB.prepare('SELECT id FROM questions WHERE id = ?').bind(questionId).first()
+  if (!question) {
+    return c.json({ error: 'Question not found' }, 404)
+  }
+
+  const formData = await c.req.formData()
+  const content = formData.get('content')?.toString().trim() || ''
+  const file = formData.get('file')
+
+  if (!content && !file) {
+    return c.json({ error: '答案内容不能为空' }, 400)
+  }
+
+  let attachmentUrl = null
+  let attachmentName = null
+  if (file) {
+    try {
+      const { buffer, fileName } = await validateUploadedFile(file, c.env)
+      // 答卷附件仅支持 PDF（前端 FileDropZone 同样限制，这里兜底）
+      if (!fileName.toLowerCase().endsWith('.pdf')) {
+        return c.json({ error: '答卷附件仅支持 PDF' }, 400)
+      }
+      const uploadResult = await uploadFileToHF(buffer, fileName, userId, c.env)
+      attachmentUrl = uploadResult.url
+      attachmentName = uploadResult.fileName
+    } catch (err) {
+      return c.json({ error: err.message }, 400)
+    }
+  }
+
+  const now = Date.now()
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO submissions (id, user_id, question_id, content, attachment_url, attachment_name, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+       ON CONFLICT (user_id, question_id) DO UPDATE SET
+         content = excluded.content,
+         attachment_url = excluded.attachment_url,
+         attachment_name = excluded.attachment_name,
+         status = 'pending',
+         updated_at = excluded.updated_at`
+    ).bind(crypto.randomUUID(), userId, questionId, content || null, attachmentUrl, attachmentName, now, now),
+    c.env.DB.prepare(
+      'DELETE FROM grades WHERE submission_id IN (SELECT id FROM submissions WHERE user_id = ? AND question_id = ?)'
+    ).bind(userId, questionId),
+  ])
+
+  // 重交时行已存在，以库内实际 id / created_at 为准
+  const row = await c.env.DB.prepare(
+    'SELECT id, created_at FROM submissions WHERE user_id = ? AND question_id = ?'
+  ).bind(userId, questionId).first()
+
+  return c.json({
+    id: row.id,
+    question_id: questionId,
+    content: content || null,
+    attachment_url: attachmentUrl,
+    attachment_name: attachmentName,
+    status: 'pending',
+    grade: null,
+    created_at: Math.floor(row.created_at / 1000),
+    updated_at: Math.floor(now / 1000),
+  }, 201)
+})
+
+// 我在该题下的提交（含批改结果；未提交时 submission 为 null）
+app.get('/api/questions/:id/submission', async (c) => {
+  const userId = c.get('userId')
+  const questionId = c.req.param('id')
+  if (!/^[0-9a-f-]{36}$/.test(questionId)) {
+    return c.json({ error: 'Invalid question ID format' }, 400)
+  }
+
+  const sub = await c.env.DB.prepare(
+    `SELECT id, content, attachment_url, attachment_name, status,
+            created_at / 1000 AS created_at, updated_at / 1000 AS updated_at
+     FROM submissions WHERE user_id = ? AND question_id = ?`
+  ).bind(userId, questionId).first()
+
+  if (!sub) {
+    return c.json({ submission: null })
+  }
+
+  const grade = await c.env.DB.prepare(
+    'SELECT id, submission_id, grader_id, score, comment, created_at / 1000 AS created_at FROM grades WHERE submission_id = ?'
+  ).bind(sub.id).first()
+
+  return c.json({
+    submission: {
+      ...sub,
+      question_id: questionId,
+      grade: grade || null,
+    },
+  })
+})
+
+// 我的提交列表（含批改状态与得分，分页）
+app.get('/api/me/submissions', async (c) => {
+  const userId = c.get('userId')
+  const page = parseInt(c.req.query('page') || '1')
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50)
+  const offset = (page - 1) * limit
+
+  const stmt = c.env.DB.prepare(
+    `SELECT s.id, s.question_id, q.title AS question_title, s.status,
+            s.created_at / 1000 AS created_at, s.updated_at / 1000 AS updated_at,
+            g.score, g.comment, g.created_at / 1000 AS graded_at
+     FROM submissions s
+     LEFT JOIN questions q ON q.id = s.question_id
+     LEFT JOIN grades g ON g.submission_id = s.id
+     WHERE s.user_id = ?
+     ORDER BY s.created_at DESC LIMIT ? OFFSET ?`
+  )
+  const rows = await stmt.bind(userId, limit, offset).all()
+  const totalStmt = c.env.DB.prepare('SELECT COUNT(*) as total FROM submissions WHERE user_id = ?')
+  const total = (await totalStmt.bind(userId).first()).total
+
+  return c.json({
+    data: rows.results || [],
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+  })
+})
+
+// 管理员批改队列（pending 升序 FIFO；graded 降序便于复查；分页）
+app.get('/api/admin/submissions/pending', async (c) => {
+  if (!requireAdmin(c)) return
+
+  const status = c.req.query('status') || 'pending'
+  if (!['pending', 'graded'].includes(status)) {
+    return c.json({ error: 'Invalid status' }, 400)
+  }
+  const page = parseInt(c.req.query('page') || '1')
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50)
+  const offset = (page - 1) * limit
+  const order = status === 'pending' ? 'ASC' : 'DESC'
+
+  const stmt = c.env.DB.prepare(
+    `SELECT s.id, s.user_id, u.username, s.question_id, q.title AS question_title,
+            s.content, s.attachment_url, s.attachment_name, s.status,
+            s.created_at / 1000 AS created_at, s.updated_at / 1000 AS updated_at,
+            g.id AS grade_id, g.grader_id, g.score, g.comment, g.created_at / 1000 AS graded_at
+     FROM submissions s
+     JOIN users u ON u.id = s.user_id
+     LEFT JOIN questions q ON q.id = s.question_id
+     LEFT JOIN grades g ON g.submission_id = s.id
+     WHERE s.status = ?
+     ORDER BY s.created_at ${order} LIMIT ? OFFSET ?`
+  )
+  const rows = await stmt.bind(status, limit, offset).all()
+  const totalStmt = c.env.DB.prepare('SELECT COUNT(*) as total FROM submissions WHERE status = ?')
+  const total = (await totalStmt.bind(status).first()).total
+
+  const data = (rows.results || []).map((row) => {
+    const { grade_id, grader_id, score, comment, graded_at, ...rest } = row
+    return {
+      ...rest,
+      grade: grade_id
+        ? { id: grade_id, submission_id: row.id, grader_id, score, comment, created_at: graded_at }
+        : null,
+    }
+  })
+
+  return c.json({
+    data,
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+  })
+})
+
+// 提交批改结果（覆盖式更新，批改后状态置为 graded）
+app.post('/api/admin/submissions/:id/grade', async (c) => {
+  if (!requireAdmin(c)) return
+
+  const submissionId = c.req.param('id')
+  if (!/^[0-9a-f-]{36}$/.test(submissionId)) {
+    return c.json({ error: 'Invalid submission ID format' }, 400)
+  }
+
+  let body
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400)
+  }
+  const { score, comment } = body
+  if (!Number.isInteger(score) || score < 0 || score > 100) {
+    return c.json({ error: 'Score must be an integer between 0 and 100' }, 400)
+  }
+  const cleanComment = typeof comment === 'string' && comment.trim() ? comment.trim() : null
+  if (cleanComment && cleanComment.length > 2000) {
+    return c.json({ error: 'Comment too long (max 2000 characters)' }, 400)
+  }
+
+  const sub = await c.env.DB.prepare('SELECT id FROM submissions WHERE id = ?').bind(submissionId).first()
+  if (!sub) {
+    return c.json({ error: 'Submission not found' }, 404)
+  }
+
+  const graderId = c.get('userId')
+  const gradeId = crypto.randomUUID()
+  const now = Date.now()
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO grades (id, submission_id, grader_id, score, comment, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (submission_id) DO UPDATE SET
+         score = excluded.score,
+         comment = excluded.comment,
+         grader_id = excluded.grader_id,
+         updated_at = excluded.updated_at`
+    ).bind(gradeId, submissionId, graderId, score, cleanComment, now, now),
+    c.env.DB.prepare('UPDATE submissions SET status = ?, updated_at = ? WHERE id = ?')
+      .bind('graded', now, submissionId),
+  ])
+
+  return c.json({
+    id: gradeId,
+    submission_id: submissionId,
+    grader_id: graderId,
+    score,
+    comment: cleanComment,
+    status: 'graded',
+    created_at: Math.floor(now / 1000),
+  })
+})
+
+// 管理员全局统计看板（KPI、分数分布、题目难度、14 天趋势）
+app.get('/api/admin/statistics/overview', async (c) => {
+  if (!requireAdmin(c)) return
+
+  const kpiRow = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(status = 'pending'), 0) AS pending,
+            COALESCE(SUM(status = 'graded'), 0) AS graded,
+            COUNT(DISTINCT user_id) AS students
+     FROM submissions`
+  ).first()
+  const avgRow = await c.env.DB.prepare('SELECT AVG(score) AS avg_score FROM grades').first()
+
+  const distRows = (await c.env.DB.prepare(
+    `SELECT CASE WHEN score < 60 THEN '0-59' WHEN score < 70 THEN '60-69'
+                 WHEN score < 80 THEN '70-79' WHEN score < 90 THEN '80-89'
+                 ELSE '90-100' END AS bucket, COUNT(*) AS count
+     FROM grades GROUP BY bucket`
+  ).all()).results || []
+
+  const diffRows = (await c.env.DB.prepare(
+    `SELECT s.question_id, q.title, ROUND(AVG(g.score), 1) AS avg_score, COUNT(g.id) AS graded_count
+     FROM submissions s
+     JOIN grades g ON g.submission_id = s.id
+     JOIN questions q ON q.id = s.question_id
+     GROUP BY s.question_id, q.title
+     ORDER BY avg_score ASC`
+  ).all()).results || []
+
+  // 14 天趋势：按北京时间（UTC+8）分天；SQLite 日期函数是 UTC 锚定会错日，故在 JS 分桶
+  const TZ_OFFSET = 8 * 3600 * 1000
+  const dayMs = 86400000
+  const now = Date.now()
+  const startLocal = now + TZ_OFFSET - 13 * dayMs
+  const subRows = (await c.env.DB.prepare('SELECT created_at FROM submissions WHERE created_at >= ?').bind(startLocal - TZ_OFFSET).all()).results || []
+  const gradeRows = (await c.env.DB.prepare('SELECT created_at FROM grades WHERE created_at >= ?').bind(startLocal - TZ_OFFSET).all()).results || []
+
+  const bucketByDay = (rows) => {
+    const counts = new Array(14).fill(0)
+    for (const row of rows) {
+      const idx = Math.min(13, Math.max(0, Math.floor((row.created_at + TZ_OFFSET - startLocal) / dayMs)))
+      counts[idx]++
+    }
+    return counts
+  }
+  const submitted = bucketByDay(subRows)
+  const graded = bucketByDay(gradeRows)
+  const trend = submitted.map((_, i) => {
+    const d = new Date(startLocal + i * dayMs)
+    const label = `${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+    return { date: label, submitted: submitted[i], graded: graded[i] }
+  })
+
+  // 分数分布补齐 5 个标准桶（无批改的桶补 0）
+  const bucketOrder = ['0-59', '60-69', '70-79', '80-89', '90-100']
+  const distMap = Object.fromEntries(distRows.map((r) => [r.bucket, r.count]))
+  const score_distribution = bucketOrder.map((bucket) => ({ bucket, count: distMap[bucket] || 0 }))
+
+  const round1 = (v) => (v === null || v === undefined ? null : Math.round(v * 10) / 10)
+
+  return c.json({
+    kpis: {
+      total_submissions: kpiRow.total,
+      pending_submissions: kpiRow.pending,
+      graded_submissions: kpiRow.graded,
+      avg_score: round1(avgRow.avg_score),
+      students: kpiRow.students,
+    },
+    score_distribution,
+    question_difficulty: diffRows,
+    trend,
+  })
+})
+
+// 学生个人学情（平均分对比、各题得失、近 10 次成绩）
+app.get('/api/me/statistics', async (c) => {
+  const userId = c.get('userId')
+
+  const myAvgRow = await c.env.DB.prepare(
+    `SELECT AVG(g.score) AS my_avg, COUNT(*) AS graded_count
+     FROM grades g
+     JOIN submissions s ON g.submission_id = s.id
+     WHERE s.user_id = ?`
+  ).bind(userId).first()
+  const globalAvgRow = await c.env.DB.prepare('SELECT AVG(score) AS global_avg FROM grades').first()
+  const totalRow = await c.env.DB.prepare(
+    'SELECT COUNT(*) AS total FROM submissions WHERE user_id = ?'
+  ).bind(userId).first()
+
+  const perQuestion = (await c.env.DB.prepare(
+    `SELECT s.question_id, q.title, g.score,
+            (SELECT ROUND(AVG(g2.score), 1) FROM grades g2
+              JOIN submissions s2 ON g2.submission_id = s2.id
+             WHERE s2.question_id = s.question_id) AS global_avg
+     FROM submissions s
+     JOIN grades g ON g.submission_id = s.id
+     LEFT JOIN questions q ON q.id = s.question_id
+     WHERE s.user_id = ?
+     ORDER BY s.created_at DESC`
+  ).bind(userId).all()).results || []
+
+  const lastGrades = (await c.env.DB.prepare(
+    `SELECT s.question_id, q.title, g.score, g.created_at / 1000 AS created_at
+     FROM grades g
+     JOIN submissions s ON g.submission_id = s.id
+     LEFT JOIN questions q ON q.id = s.question_id
+     WHERE s.user_id = ?
+     ORDER BY g.created_at DESC LIMIT 10`
+  ).bind(userId).all()).results || []
+
+  const round1 = (v) => (v === null || v === undefined ? null : Math.round(v * 10) / 10)
+
+  return c.json({
+    summary: {
+      my_avg: round1(myAvgRow.my_avg),
+      global_avg: round1(globalAvgRow.global_avg),
+      graded_count: myAvgRow.graded_count,
+      total_submissions: totalRow.total,
+    },
+    per_question: perQuestion,
+    last_grades: lastGrades,
   })
 })
 
