@@ -470,7 +470,7 @@ app.get('/api/me/questions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, options, answer, attachment_url, created_at / 1000 AS created_at
+    `SELECT id, title, content, answer, attachment_url, created_at / 1000 AS created_at
      FROM questions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(userId, limit, offset).all()
@@ -861,18 +861,17 @@ app.post('/api/posts/:id/replies', async (c) => {
 })
 
 // ---------- 题目路由 ----------
-// 创建题目（支持附件）
+// 创建题目（支持附件；题目与参考答案均为 markdown）
 app.post('/api/questions', async (c) => {
   const userId = c.get('userId')
   const formData = await c.req.formData()
   const title = formData.get('title')?.toString() || ''
   const content = formData.get('content')?.toString() || ''
-  const options = formData.get('options')?.toString() || '[]'
   const answer = formData.get('answer')?.toString() || ''
   const file = formData.get('file')
 
-  if (!title || !content || !options) {
-    return c.json({ error: 'Title, content and options are required' }, 400)
+  if (!title || !content) {
+    return c.json({ error: 'Title and content are required' }, 400)
   }
 
   let attachmentUrl = null
@@ -889,17 +888,16 @@ app.post('/api/questions', async (c) => {
   const id = crypto.randomUUID()
   const now = Date.now()
   const stmt = c.env.DB.prepare(
-    `INSERT INTO questions (id, title, content, options, answer, user_id, attachment_url, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO questions (id, title, content, answer, user_id, attachment_url, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   )
-  await stmt.bind(id, title, content, options, answer, userId, attachmentUrl, now, now).run()
+  await stmt.bind(id, title, content, answer, userId, attachmentUrl, now, now).run()
 
   const author = await fetchAuthor(c.env, userId)
   return c.json({
     id,
     title,
     content,
-    options: JSON.parse(options),
     answer,
     user_id: userId,
     author,
@@ -915,7 +913,7 @@ app.get('/api/questions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT q.id, q.title, q.content, q.options, q.answer, q.user_id, q.attachment_url,
+    `SELECT q.id, q.title, q.content, q.answer, q.user_id, q.attachment_url,
             q.created_at / 1000 AS created_at,
             u.username AS author_username, u.avatar_url AS author_avatar_url
      FROM questions q
