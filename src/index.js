@@ -67,6 +67,17 @@ async function verifyPassword(password, hash, salt) {
   const computedHash = await hashPassword(password, salt)
   return computedHash === hash
 }
+// ---------- Turnstile 人机验证 ----------
+async function verifyTurnstile(token, secret) {
+  const body = new FormData()
+  body.append('secret', secret)
+  body.append('response', token)
+  const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    body,
+  })
+  return res.json()
+}
 // 计算 MD5（用于 Gravatar）
 async function md5(message) {
   const msgUint8 = new TextEncoder().encode(message)
@@ -253,7 +264,7 @@ app.use('/api/*', async (c, next) => {
 // ---------- 认证路由 ----------
 // 注册
 app.post('/api/auth/register', async (c) => {
-  const { username, email, password } = await c.req.json()
+  const { username, email, password, turnstile_token } = await c.req.json()
   if (!username || !email || !password) {
     return c.json({ error: 'Username, email and password required' }, 400)
   }
@@ -263,6 +274,26 @@ app.post('/api/auth/register', async (c) => {
   }
   if (password.length < 6) {
     return c.json({ error: 'Password must be at least 6 characters' }, 400)
+  }
+
+  // Turnstile 人机验证（fail closed：密钥缺失或验证异常一律拒绝注册）
+  if (typeof turnstile_token !== 'string' || !turnstile_token) {
+    return c.json({ error: 'Captcha token required' }, 400)
+  }
+  const turnstileSecret = c.env.TURNSTILE_SECRET
+  if (!turnstileSecret) {
+    console.error('TURNSTILE_SECRET is not configured')
+    return c.json({ error: 'Server configuration error' }, 500)
+  }
+  let siteverify
+  try {
+    siteverify = await verifyTurnstile(turnstile_token, turnstileSecret)
+  } catch (err) {
+    console.error('Turnstile siteverify request failed:', err)
+    return c.json({ error: 'Server configuration error' }, 500)
+  }
+  if (!siteverify.success) {
+    return c.json({ error: 'Captcha verification failed' }, 400)
   }
 
   // 检查用户名或邮箱是否已存在
@@ -353,8 +384,8 @@ app.get('/api/me', async (c) => {
     username: user.username,
     avatar: avatar || null,
     bio: user.bio || '',
-    created_at: user.created_at,
-    badges: badges.results || [],
+    created_at: Math.floor(user.created_at / 1000),
+    badges: (badges.results || []).map((b) => ({ ...b, awarded_at: Math.floor(b.awarded_at / 1000) })),
   });
 });
 // 更新个人信息（bio / avatar_url）
@@ -391,7 +422,7 @@ app.get('/api/me/posts', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, reply_count, attachment_url, created_at
+    `SELECT id, title, content, reply_count, attachment_url, created_at / 1000 AS created_at
      FROM posts WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(userId, limit, offset).all()
@@ -414,7 +445,7 @@ app.get('/api/me/questions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, options, answer, attachment_url, created_at
+    `SELECT id, title, content, options, answer, attachment_url, created_at / 1000 AS created_at
      FROM questions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(userId, limit, offset).all()
@@ -435,7 +466,7 @@ app.get('/api/me/files', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, file_name, file_path, file_url, file_size, mime_type, created_at
+    `SELECT id, file_name, file_path, file_url, file_size, mime_type, created_at / 1000 AS created_at
      FROM files WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(userId, limit, offset).all()
@@ -458,7 +489,7 @@ app.get('/api/announcements', async (c) => {
   const offset = (page - 1) * limit;
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, author_id, created_at
+    `SELECT id, title, content, author_id, created_at / 1000 AS created_at
      FROM announcements ORDER BY created_at DESC LIMIT ? OFFSET ?`
   );
   const rows = await stmt.bind(limit, offset).all();
@@ -492,7 +523,7 @@ app.post('/api/announcements', async (c) => {
      VALUES (?, ?, ?, ?, ?, ?)`
   ).bind(id, title, content, userId, now, now).run();
 
-  return c.json({ id, title, content, created_at: now }, 201);
+  return c.json({ id, title, content, created_at: Math.floor(now / 1000) }, 201);
 });
 // 帖子详情（带缓存）
 app.get('/api/posts/:id', async (c) => {
@@ -510,7 +541,7 @@ app.get('/api/posts/:id', async (c) => {
 
   // 2. KV
   const kv = c.env.POSTS_CACHE
-  const kvKey = `post:${postId}`
+  const kvKey = `post:v2:${postId}` // v2：详情补上 likes_count、时间戳改为秒（旧缓存键作废）
   let kvData = await kv.get(kvKey, 'json')
   if (kvData) {
     const resp = c.json(kvData)
@@ -520,7 +551,7 @@ app.get('/api/posts/:id', async (c) => {
 
   // 3. D1
   const stmt = c.env.DB.prepare(
-    'SELECT id, title, content, user_id, reply_count, attachment_url, created_at FROM posts WHERE id = ?'
+    'SELECT id, title, content, user_id, reply_count, likes_count, attachment_url, created_at / 1000 AS created_at FROM posts WHERE id = ?'
   )
   const post = await stmt.bind(postId).first()
   if (!post) {
@@ -549,10 +580,10 @@ app.get('/api/posts/:id/replies', async (c) => {
   }
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, content, user_id, attachment_url, created_at 
-     FROM replies 
-     WHERE post_id = ? AND status = 'active' 
-     ORDER BY created_at DESC 
+    `SELECT id, content, user_id, attachment_url, created_at / 1000 AS created_at
+     FROM replies
+     WHERE post_id = ? AND status = 'active'
+     ORDER BY created_at DESC
      LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(postId, limit, offset).all()
@@ -587,7 +618,6 @@ app.post('/api/posts/:id/like', async (c) => {
       .bind(userId, postId).run();
     await c.env.DB.prepare('UPDATE posts SET likes_count = likes_count - 1 WHERE id = ?')
       .bind(postId).run();
-    return c.json({ liked: false, likes_count: await getLikesCount(postId, c.env) });
   } else {
     // 添加点赞
     await c.env.DB.prepare(
@@ -595,8 +625,10 @@ app.post('/api/posts/:id/like', async (c) => {
     ).bind(userId, postId, now).run();
     await c.env.DB.prepare('UPDATE posts SET likes_count = likes_count + 1 WHERE id = ?')
       .bind(postId).run();
-    return c.json({ liked: true, likes_count: await getLikesCount(postId, c.env) });
   }
+  // 计数已变化：详情缓存失效
+  await invalidatePostCache(postId, c);
+  return c.json({ liked: !existing, likes_count: await getLikesCount(postId, c.env) });
 });
 
 // 辅助：获取点赞数（可复用）
@@ -604,6 +636,13 @@ async function getLikesCount(postId, env) {
   const result = await env.DB.prepare('SELECT likes_count FROM posts WHERE id = ?')
     .bind(postId).first();
   return result ? result.likes_count : 0;
+}
+// 辅助：帖子详情缓存失效（点赞数/回复数变化后调用；KV 键见 GET /api/posts/:id）
+async function invalidatePostCache(postId, c) {
+  await c.env.POSTS_CACHE.delete(`post:v2:${postId}`);
+  const detailUrl = new URL(c.req.url);
+  detailUrl.pathname = `/api/posts/${postId}`;
+  c.executionCtx.waitUntil(caches.default.delete(detailUrl.toString()));
 }
 // ---------- 帖子列表（分页、排序、筛选） ----------
 app.get('/api/posts', async (c) => {
@@ -628,7 +667,7 @@ app.get('/api/posts', async (c) => {
   const safeOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC'
 
   const sql = `
-    SELECT id, title, content, user_id, reply_count, likes_count, attachment_url, created_at
+    SELECT id, title, content, user_id, reply_count, likes_count, attachment_url, created_at / 1000 AS created_at
     FROM posts
     ${whereClause}
     ORDER BY ${safeSort} ${safeOrder}
@@ -703,7 +742,7 @@ app.post('/api/posts', async (c) => {
     content,
     user_id: userId,
     attachment_url: attachmentUrl,
-    created_at: now,
+    created_at: Math.floor(now / 1000),
   }, 201)
 })
 
@@ -744,13 +783,16 @@ app.post('/api/posts/:id/replies', async (c) => {
   )
   await updateStmt.bind(now, postId).run()
 
+  // 回复数已变化：详情缓存失效
+  await invalidatePostCache(postId, c)
+
   return c.json({
     id,
     content,
     user_id: userId,
     post_id: postId,
     attachment_url: attachmentUrl,
-    created_at: now,
+    created_at: Math.floor(now / 1000),
   }, 201)
 })
 
@@ -796,7 +838,7 @@ app.post('/api/questions', async (c) => {
     answer,
     user_id: userId,
     attachment_url: attachmentUrl,
-    created_at: now,
+    created_at: Math.floor(now / 1000),
   }, 201)
 })
 
@@ -807,7 +849,7 @@ app.get('/api/questions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, options, answer, user_id, attachment_url, created_at
+    `SELECT id, title, content, options, answer, user_id, attachment_url, created_at / 1000 AS created_at
      FROM questions ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(limit, offset).all()
