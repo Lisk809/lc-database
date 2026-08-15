@@ -223,7 +223,7 @@ app.use('*', async (c, next) => {
 })
 
 app.use('/api/*', async (c, next) => {
-  if (c.req.path.startsWith('/api/auth/')) {
+  if (c.req.path.startsWith('/api/auth/') || c.req.path.startsWith('/api/pwnedpasswords/')) {
     await next()
     return
   }
@@ -267,6 +267,24 @@ app.use('/api/*', async (c, next) => {
   }
   await next()
 })
+// ---------- Pwned Passwords 代理（k-匿名性） ----------
+// 前端在本地计算密码 SHA-1，只把前 5 位前缀发到这里；后端代理请求 HIBP 并带上 User-Agent
+app.get('/api/pwnedpasswords/:prefix', async (c) => {
+  const prefix = c.req.param('prefix')
+  if (!/^[0-9A-F]{5}$/.test(prefix)) {
+    return c.json({ error: 'Invalid prefix' }, 400)
+  }
+  const res = await fetch(`https://api.pwnedpasswords.com/range/${prefix}`, {
+    headers: { 'User-Agent': 'LunaticChO/1.0 (Cloudflare Worker)' },
+  })
+  if (!res.ok) {
+    return c.json({ error: 'Pwned Passwords service unavailable' }, 502)
+  }
+  return c.text(await res.text(), 200, {
+    'Cache-Control': 'public, max-age=86400',
+  })
+})
+
 // ---------- 认证路由 ----------
 // 注册
 app.post('/api/auth/register', async (c) => {
