@@ -388,7 +388,7 @@ app.post('/api/auth/login', async (c) => {
 app.get('/api/me', async (c) => {
   const userId = c.get('userId');
   const user = await c.env.DB.prepare(
-    'SELECT id, username, email, avatar_url, bio, created_at FROM users WHERE id = ?'
+    'SELECT id, username, email, bio, created_at FROM users WHERE id = ?'
   ).bind(userId).first();
   if (!user) return c.json({ error: 'User not found' }, 404);
 
@@ -400,42 +400,29 @@ app.get('/api/me', async (c) => {
      WHERE ub.user_id = ? ORDER BY ub.awarded_at DESC`
   ).bind(userId).all();
 
-  let avatar = user.avatar_url;
-  if (!avatar && user.email) avatar = await getGravatarUrl(user.email);
+  // 头像统一使用 Gravatar（由注册邮箱决定），不再支持自定义头像上传
+  const avatar = await getGravatarUrl(user.email);
 
   return c.json({
     id: user.id,
     username: user.username,
-    avatar: avatar || null,
+    avatar,
     bio: user.bio || '',
     created_at: Math.floor(user.created_at / 1000),
     is_admin: getAdminIds(c.env).includes(userId),
     badges: (badges.results || []).map((b) => ({ ...b, awarded_at: Math.floor(b.awarded_at / 1000) })),
   });
 });
-// 更新个人信息（bio / avatar_url）
+// 更新个人信息（仅 bio；头像由 Gravatar 提供，不接受自定义）
 app.patch('/api/me', async (c) => {
   const userId = c.get('userId')
-  const { bio, avatar_url } = await c.req.json()
-  let updates = []
-  let values = []
-  if (bio !== undefined) {
-    updates.push('bio = ?')
-    values.push(bio)
-  }
-  if (avatar_url !== undefined) {
-    updates.push('avatar_url = ?')
-    values.push(avatar_url)
-  }
-  if (updates.length === 0) {
+  const { bio } = await c.req.json()
+  if (bio === undefined) {
     return c.json({ error: 'No fields to update' }, 400)
   }
-  values.push(Date.now())
-  values.push(userId)
-  const stmt = c.env.DB.prepare(
-    `UPDATE users SET ${updates.join(', ')}, updated_at = ? WHERE id = ?`
-  )
-  await stmt.bind(...values).run()
+  await c.env.DB.prepare(
+    'UPDATE users SET bio = ?, updated_at = ? WHERE id = ?'
+  ).bind(bio, Date.now(), userId).run()
   return c.json({ message: 'Profile updated' })
 })
 
@@ -515,7 +502,7 @@ app.get('/api/announcements', async (c) => {
 
   const stmt = c.env.DB.prepare(
     `SELECT a.id, a.title, a.content, a.author_id, a.created_at / 1000 AS created_at,
-            u.username AS author_username, u.avatar_url AS author_avatar_url
+            u.username AS author_username, u.email AS author_email
      FROM announcements a
      LEFT JOIN users u ON u.id = a.author_id
      ORDER BY a.created_at DESC LIMIT ? OFFSET ?`
@@ -525,7 +512,7 @@ app.get('/api/announcements', async (c) => {
   const total = (await totalStmt.first()).total;
 
   return c.json({
-    data: (rows.results || []).map((row) => withAuthor(row, 'author_id')),
+    data: await Promise.all((rows.results || []).map((row) => withAuthor(row, 'author_id'))),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   });
 });
@@ -560,7 +547,8 @@ app.get('/api/posts/:id', async (c) => {
     return c.json({ error: 'Invalid post ID format' }, 400)
   }
 
-  const cacheKey = new Request(c.req.url, c.req.raw)
+  // v4：头像改为 Gravatar，缓存键带版本号使旧条目（可能含自定义头像）失效
+  const cacheKey = new Request(c.req.url + (c.req.url.includes('?') ? '&v=4' : '?v=4'), c.req.raw)
   const cache = caches.default
 
   // 1. Cache API
@@ -569,7 +557,7 @@ app.get('/api/posts/:id', async (c) => {
 
   // 2. KV
   const kv = c.env.POSTS_CACHE
-  const kvKey = `post:v3:${postId}` // v3：详情带上 author 作者信息（旧缓存键作废）
+  const kvKey = `post:v4:${postId}` // v4：头像改为 Gravatar（旧缓存键作废）
   let kvData = await kv.get(kvKey, 'json')
   if (kvData) {
     const resp = c.json(kvData)
@@ -581,7 +569,7 @@ app.get('/api/posts/:id', async (c) => {
   const stmt = c.env.DB.prepare(
     `SELECT p.id, p.title, p.content, p.user_id, p.reply_count, p.likes_count, p.attachment_url,
             p.created_at / 1000 AS created_at,
-            u.username AS author_username, u.avatar_url AS author_avatar_url
+            u.username AS author_username, u.email AS author_email
      FROM posts p
      LEFT JOIN users u ON u.id = p.user_id
      WHERE p.id = ?`
@@ -591,7 +579,7 @@ app.get('/api/posts/:id', async (c) => {
     return c.json({ error: 'Post not found' }, 404)
   }
 
-  const body = withAuthor(post)
+  const body = await withAuthor(post)
 
   // 异步回填缓存
   c.executionCtx.waitUntil((async () => {
@@ -616,7 +604,7 @@ app.get('/api/posts/:id/replies', async (c) => {
 
   const stmt = c.env.DB.prepare(
     `SELECT r.id, r.content, r.user_id, r.attachment_url, r.created_at / 1000 AS created_at,
-            u.username AS author_username, u.avatar_url AS author_avatar_url
+            u.username AS author_username, u.email AS author_email
      FROM replies r
      LEFT JOIN users u ON u.id = r.user_id
      WHERE r.post_id = ? AND r.status = 'active'
@@ -630,7 +618,7 @@ app.get('/api/posts/:id/replies', async (c) => {
   const total = (await totalStmt.bind(postId).first()).total
 
   return c.json({
-    data: (rows.results || []).map((row) => withAuthor(row)),
+    data: await Promise.all((rows.results || []).map((row) => withAuthor(row))),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
 })
@@ -675,30 +663,33 @@ async function getLikesCount(postId, env) {
   return result ? result.likes_count : 0;
 }
 
-// 辅助：把联表查出的作者字段（author_username / author_avatar_url）组装成 author 对象
-// LEFT JOIN 查不到用户时返回 null（如用户已删除）
-function withAuthor(row, idField = 'user_id') {
-  const { author_username, author_avatar_url, ...rest } = row
+// 辅助：把联表查出的作者字段（author_username / author_email）组装成 author 对象
+// 头像统一为 Gravatar（由邮箱决定）；LEFT JOIN 查不到用户时返回 null（如用户已删除）
+async function withAuthor(row, idField = 'user_id') {
+  const { author_username, author_email, ...rest } = row
   return {
     ...rest,
     author: author_username
-      ? { id: row[idField], username: author_username, avatar_url: author_avatar_url || null }
+      ? { id: row[idField], username: author_username, avatar_url: await getGravatarUrl(author_email) }
       : null,
   }
 }
 
-// 辅助：按 id 取用户，供创建接口返回作者信息
+// 辅助：按 id 取用户，供创建接口返回作者信息（头像为 Gravatar）
 async function fetchAuthor(env, userId) {
   const user = await env.DB.prepare(
-    'SELECT username, avatar_url FROM users WHERE id = ?'
+    'SELECT username, email FROM users WHERE id = ?'
   ).bind(userId).first()
-  return user ? { id: userId, username: user.username, avatar_url: user.avatar_url || null } : null
+  return user
+    ? { id: userId, username: user.username, avatar_url: await getGravatarUrl(user.email) }
+    : null
 }
 // 辅助：帖子详情缓存失效（点赞数/回复数变化后调用；KV 键见 GET /api/posts/:id）
 async function invalidatePostCache(postId, c) {
-  await c.env.POSTS_CACHE.delete(`post:v3:${postId}`);
+  await c.env.POSTS_CACHE.delete(`post:v4:${postId}`);
   const detailUrl = new URL(c.req.url);
   detailUrl.pathname = `/api/posts/${postId}`;
+  detailUrl.search = 'v=4';
   c.executionCtx.waitUntil(caches.default.delete(detailUrl.toString()));
 }
 // ---------- 帖子列表（分页、排序、筛选） ----------
@@ -726,7 +717,7 @@ app.get('/api/posts', async (c) => {
   const sql = `
     SELECT p.id, p.title, p.content, p.user_id, p.reply_count, p.likes_count, p.attachment_url,
            p.created_at / 1000 AS created_at,
-           u.username AS author_username, u.avatar_url AS author_avatar_url
+           u.username AS author_username, u.email AS author_email
     FROM posts p
     LEFT JOIN users u ON u.id = p.user_id
     ${whereClause}
@@ -758,7 +749,7 @@ app.get('/api/posts', async (c) => {
   if (cached) return cached
 
   const response = c.json({
-    data: (rows.results || []).map((row) => withAuthor(row)),
+    data: await Promise.all((rows.results || []).map((row) => withAuthor(row))),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
   response.headers.set('Cache-Control', 'public, max-age=30, s-maxage=30, stale-while-revalidate=30')
@@ -915,7 +906,7 @@ app.get('/api/questions', async (c) => {
   const stmt = c.env.DB.prepare(
     `SELECT q.id, q.title, q.content, q.answer, q.user_id, q.attachment_url,
             q.created_at / 1000 AS created_at,
-            u.username AS author_username, u.avatar_url AS author_avatar_url
+            u.username AS author_username, u.email AS author_email
      FROM questions q
      LEFT JOIN users u ON u.id = q.user_id
      ORDER BY q.created_at DESC LIMIT ? OFFSET ?`
@@ -925,7 +916,7 @@ app.get('/api/questions', async (c) => {
   const total = (await totalStmt.first()).total
 
   return c.json({
-    data: (rows.results || []).map((row) => withAuthor(row)),
+    data: await Promise.all((rows.results || []).map((row) => withAuthor(row))),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
 })
