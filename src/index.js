@@ -67,6 +67,12 @@ async function verifyPassword(password, hash, salt) {
   const computedHash = await hashPassword(password, salt)
   return computedHash === hash
 }
+// ---------- 管理员名单 ----------
+// 管理员人数少、身份单一：直接读 Secret（ADMIN_USER_IDS，逗号分隔的用户 ID），
+// 不在数据库里维护管理员标记
+function getAdminIds(env) {
+  return (env.ADMIN_USER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean)
+}
 // ---------- Turnstile 人机验证 ----------
 async function verifyTurnstile(token, secret) {
   const body = new FormData()
@@ -385,6 +391,7 @@ app.get('/api/me', async (c) => {
     avatar: avatar || null,
     bio: user.bio || '',
     created_at: Math.floor(user.created_at / 1000),
+    is_admin: getAdminIds(c.env).includes(userId),
     badges: (badges.results || []).map((b) => ({ ...b, awarded_at: Math.floor(b.awarded_at / 1000) })),
   });
 });
@@ -508,9 +515,8 @@ app.get('/api/announcements', async (c) => {
 // 发布公告（仅管理员）
 app.post('/api/announcements', async (c) => {
   const userId = c.get('userId');
-  // 检查管理员权限：这里简单用环境变量 ADMIN_USER_IDS 逗号分隔
-  const adminIds = (c.env.ADMIN_USER_IDS || '').split(',').map(s => s.trim());
-  if (!adminIds.includes(userId)) {
+  // 检查管理员权限：名单来自 Secret（ADMIN_USER_IDS），见 getAdminIds
+  if (!getAdminIds(c.env).includes(userId)) {
     return c.json({ error: 'Forbidden' }, 403);
   }
 
