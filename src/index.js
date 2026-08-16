@@ -449,7 +449,7 @@ app.get('/api/me/questions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, answer, attachment_url, created_at / 1000 AS created_at
+    `SELECT id, title, content, answer, attachment_url, status, created_at / 1000 AS created_at
      FROM questions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(userId, limit, offset).all()
@@ -846,6 +846,7 @@ app.post('/api/posts/:id/replies', async (c) => {
 // ---------- 题目路由 ----------
 // 创建题目（支持附件；题目与参考答案均为 markdown）
 app.post('/api/questions', async (c) => {
+  if (!requireAdmin(c)) return
   const userId = c.get('userId')
   const formData = await c.req.formData()
   const title = formData.get('title')?.toString() || ''
@@ -871,8 +872,8 @@ app.post('/api/questions', async (c) => {
   const id = crypto.randomUUID()
   const now = Date.now()
   const stmt = c.env.DB.prepare(
-    `INSERT INTO questions (id, title, content, answer, user_id, attachment_url, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO questions (id, title, content, answer, user_id, attachment_url, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)`
   )
   await stmt.bind(id, title, content, answer, userId, attachmentUrl, now, now).run()
 
@@ -885,32 +886,74 @@ app.post('/api/questions', async (c) => {
     user_id: userId,
     author,
     attachment_url: attachmentUrl,
+    status: 'draft',
     created_at: Math.floor(now / 1000),
   }, 201)
 })
 
-// 题目列表（分页）
+// 题目列表（分页）：管理员可见全部（含草稿），普通用户仅见已发布
 app.get('/api/questions', async (c) => {
   const page = parseInt(c.req.query('page') || '1')
   const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50)
   const offset = (page - 1) * limit
+  const isAdmin = getAdminIds(c.env).includes(c.get('userId'))
 
   const stmt = c.env.DB.prepare(
-    `SELECT q.id, q.title, q.content, q.answer, q.user_id, q.attachment_url,
+    `SELECT q.id, q.title, q.content, q.answer, q.user_id, q.attachment_url, q.status,
             q.created_at / 1000 AS created_at,
             u.username AS author_username, u.email AS author_email
      FROM questions q
      LEFT JOIN users u ON u.id = q.user_id
+     ${isAdmin ? '' : 'WHERE q.status = ?'}
      ORDER BY q.created_at DESC LIMIT ? OFFSET ?`
   )
-  const rows = await stmt.bind(limit, offset).all()
-  const totalStmt = c.env.DB.prepare('SELECT COUNT(*) as total FROM questions')
-  const total = (await totalStmt.first()).total
+  const rows = isAdmin
+    ? await stmt.bind(limit, offset).all()
+    : await stmt.bind('published', limit, offset).all()
+  const totalStmt = c.env.DB.prepare(
+    isAdmin
+      ? 'SELECT COUNT(*) as total FROM questions'
+      : 'SELECT COUNT(*) as total FROM questions WHERE status = ?'
+  )
+  const total = isAdmin
+    ? (await totalStmt.first()).total
+    : (await totalStmt.bind('published').first()).total
 
   return c.json({
     data: await Promise.all((rows.results || []).map((row) => withAuthor(row))),
     pagination: { page, limit, total, pages: Math.ceil(total / limit) }
   })
+})
+
+// 发布/下线题目（管理员）：draft 仅管理员可见且不可提交；published 全站可见
+app.patch('/api/questions/:id/status', async (c) => {
+  if (!requireAdmin(c)) return
+
+  const questionId = c.req.param('id')
+  if (!/^[0-9a-f-]{36}$/.test(questionId)) {
+    return c.json({ error: 'Invalid question ID format' }, 400)
+  }
+
+  let body
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400)
+  }
+  const { status } = body
+  if (!['draft', 'published'].includes(status)) {
+    return c.json({ error: 'Invalid status' }, 400)
+  }
+
+  const exists = await c.env.DB.prepare('SELECT id FROM questions WHERE id = ?').bind(questionId).first()
+  if (!exists) {
+    return c.json({ error: 'Question not found' }, 404)
+  }
+
+  await c.env.DB.prepare('UPDATE questions SET status = ?, updated_at = ? WHERE id = ?')
+    .bind(status, Date.now(), questionId).run()
+
+  return c.json({ id: questionId, status })
 })
 
 // ---------- 提交与批改路由（在线批改与学情分析系统） ----------
@@ -922,9 +965,13 @@ app.post('/api/questions/:id/submit', async (c) => {
     return c.json({ error: 'Invalid question ID format' }, 400)
   }
 
-  const question = await c.env.DB.prepare('SELECT id FROM questions WHERE id = ?').bind(questionId).first()
+  const question = await c.env.DB.prepare('SELECT id, status FROM questions WHERE id = ?').bind(questionId).first()
   if (!question) {
     return c.json({ error: 'Question not found' }, 404)
+  }
+  // 草稿/已下线题目不接受新提交（已有提交不受影响）
+  if (question.status !== 'published') {
+    return c.json({ error: 'Question is not published' }, 403)
   }
 
   const formData = await c.req.formData()
