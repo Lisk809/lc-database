@@ -449,7 +449,7 @@ app.get('/api/me/questions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT id, title, content, answer, attachment_url, status, created_at / 1000 AS created_at
+    `SELECT id, title, content, answer, attachment_url, created_at / 1000 AS created_at
      FROM questions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
   const rows = await stmt.bind(userId, limit, offset).all()
@@ -846,7 +846,6 @@ app.post('/api/posts/:id/replies', async (c) => {
 // ---------- 题目路由 ----------
 // 创建题目（支持附件；题目与参考答案均为 markdown）
 app.post('/api/questions', async (c) => {
-  if (!requireAdmin(c)) return
   const userId = c.get('userId')
   const formData = await c.req.formData()
   const title = formData.get('title')?.toString() || ''
@@ -872,8 +871,8 @@ app.post('/api/questions', async (c) => {
   const id = crypto.randomUUID()
   const now = Date.now()
   const stmt = c.env.DB.prepare(
-    `INSERT INTO questions (id, title, content, answer, user_id, attachment_url, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)`
+    `INSERT INTO questions (id, title, content, answer, user_id, attachment_url, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   )
   await stmt.bind(id, title, content, answer, userId, attachmentUrl, now, now).run()
 
@@ -886,38 +885,27 @@ app.post('/api/questions', async (c) => {
     user_id: userId,
     author,
     attachment_url: attachmentUrl,
-    status: 'draft',
     created_at: Math.floor(now / 1000),
   }, 201)
 })
 
-// 题目列表（分页）：管理员可见全部（含草稿），普通用户仅见已发布
+// 题目列表（分页）
 app.get('/api/questions', async (c) => {
   const page = parseInt(c.req.query('page') || '1')
   const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50)
   const offset = (page - 1) * limit
-  const isAdmin = getAdminIds(c.env).includes(c.get('userId'))
 
   const stmt = c.env.DB.prepare(
-    `SELECT q.id, q.title, q.content, q.answer, q.user_id, q.attachment_url, q.status,
+    `SELECT q.id, q.title, q.content, q.answer, q.user_id, q.attachment_url,
             q.created_at / 1000 AS created_at,
             u.username AS author_username, u.email AS author_email
      FROM questions q
      LEFT JOIN users u ON u.id = q.user_id
-     ${isAdmin ? '' : 'WHERE q.status = ?'}
      ORDER BY q.created_at DESC LIMIT ? OFFSET ?`
   )
-  const rows = isAdmin
-    ? await stmt.bind(limit, offset).all()
-    : await stmt.bind('published', limit, offset).all()
-  const totalStmt = c.env.DB.prepare(
-    isAdmin
-      ? 'SELECT COUNT(*) as total FROM questions'
-      : 'SELECT COUNT(*) as total FROM questions WHERE status = ?'
-  )
-  const total = isAdmin
-    ? (await totalStmt.first()).total
-    : (await totalStmt.bind('published').first()).total
+  const rows = await stmt.bind(limit, offset).all()
+  const totalStmt = c.env.DB.prepare('SELECT COUNT(*) as total FROM questions')
+  const total = (await totalStmt.first()).total
 
   return c.json({
     data: await Promise.all((rows.results || []).map((row) => withAuthor(row))),
@@ -925,13 +913,103 @@ app.get('/api/questions', async (c) => {
   })
 })
 
-// 发布/下线题目（管理员）：draft 仅管理员可见且不可提交；published 全站可见
-app.patch('/api/questions/:id/status', async (c) => {
+// ---------- 联考（试卷 + 答题卡 PDF，仅管理员创建；仅联考有提交/批改） ----------
+// 创建联考（试卷与答题卡均为必传 PDF）
+app.post('/api/exams', async (c) => {
+  if (!requireAdmin(c)) return
+  const userId = c.get('userId')
+  const formData = await c.req.formData()
+  const title = formData.get('title')?.toString().trim() || ''
+  const description = formData.get('description')?.toString().trim() || ''
+  const paper = formData.get('paper')
+  const sheet = formData.get('sheet')
+
+  if (!title) {
+    return c.json({ error: 'Title is required' }, 400)
+  }
+  if (!paper || !(paper instanceof File)) {
+    return c.json({ error: '试卷 PDF 为必传项' }, 400)
+  }
+  if (!sheet || !(sheet instanceof File)) {
+    return c.json({ error: '答题卡 PDF 为必传项' }, 400)
+  }
+
+  let paperInfo, sheetInfo
+  try {
+    if (!paper.name.toLowerCase().endsWith('.pdf')) {
+      return c.json({ error: '试卷仅支持 PDF' }, 400)
+    }
+    if (!sheet.name.toLowerCase().endsWith('.pdf')) {
+      return c.json({ error: '答题卡仅支持 PDF' }, 400)
+    }
+    const { buffer: paperBuf, fileName: paperName } = await validateUploadedFile(paper, c.env)
+    paperInfo = await uploadFileToHF(paperBuf, paperName, userId, c.env)
+    const { buffer: sheetBuf, fileName: sheetName } = await validateUploadedFile(sheet, c.env)
+    sheetInfo = await uploadFileToHF(sheetBuf, sheetName, userId, c.env)
+  } catch (err) {
+    return c.json({ error: err.message }, 400)
+  }
+
+  const id = crypto.randomUUID()
+  const now = Date.now()
+  await c.env.DB.prepare(
+    `INSERT INTO exams (id, title, description, paper_url, paper_name, sheet_url, sheet_name, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`
+  ).bind(id, title, description || null, paperInfo.url, paperInfo.fileName,
+    sheetInfo.url, sheetInfo.fileName, now, now).run()
+
+  return c.json({
+    id,
+    title,
+    description: description || null,
+    paper_url: paperInfo.url,
+    paper_name: paperInfo.fileName,
+    sheet_url: sheetInfo.url,
+    sheet_name: sheetInfo.fileName,
+    status: 'draft',
+    created_at: Math.floor(now / 1000),
+  }, 201)
+})
+
+// 联考列表（分页）：管理员可见全部（含草稿），普通用户仅见已发布
+app.get('/api/exams', async (c) => {
+  const page = parseInt(c.req.query('page') || '1')
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50)
+  const offset = (page - 1) * limit
+  const isAdmin = getAdminIds(c.env).includes(c.get('userId'))
+
+  const stmt = c.env.DB.prepare(
+    `SELECT id, title, description, paper_url, paper_name, sheet_url, sheet_name, status,
+            created_at / 1000 AS created_at
+     FROM exams
+     ${isAdmin ? '' : 'WHERE status = ?'}
+     ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  )
+  const rows = isAdmin
+    ? await stmt.bind(limit, offset).all()
+    : await stmt.bind('published', limit, offset).all()
+  const totalStmt = c.env.DB.prepare(
+    isAdmin
+      ? 'SELECT COUNT(*) as total FROM exams'
+      : 'SELECT COUNT(*) as total FROM exams WHERE status = ?'
+  )
+  const total = isAdmin
+    ? (await totalStmt.first()).total
+    : (await totalStmt.bind('published').first()).total
+
+  return c.json({
+    data: rows.results || [],
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) }
+  })
+})
+
+// 发布/下线联考（管理员）：draft 仅管理员可见且不可提交；published 全站可见
+app.patch('/api/exams/:id/status', async (c) => {
   if (!requireAdmin(c)) return
 
-  const questionId = c.req.param('id')
-  if (!/^[0-9a-f-]{36}$/.test(questionId)) {
-    return c.json({ error: 'Invalid question ID format' }, 400)
+  const examId = c.req.param('id')
+  if (!/^[0-9a-f-]{36}$/.test(examId)) {
+    return c.json({ error: 'Invalid exam ID format' }, 400)
   }
 
   let body
@@ -945,86 +1023,81 @@ app.patch('/api/questions/:id/status', async (c) => {
     return c.json({ error: 'Invalid status' }, 400)
   }
 
-  const exists = await c.env.DB.prepare('SELECT id FROM questions WHERE id = ?').bind(questionId).first()
+  const exists = await c.env.DB.prepare('SELECT id FROM exams WHERE id = ?').bind(examId).first()
   if (!exists) {
-    return c.json({ error: 'Question not found' }, 404)
+    return c.json({ error: 'Exam not found' }, 404)
   }
 
-  await c.env.DB.prepare('UPDATE questions SET status = ?, updated_at = ? WHERE id = ?')
-    .bind(status, Date.now(), questionId).run()
+  await c.env.DB.prepare('UPDATE exams SET status = ?, updated_at = ? WHERE id = ?')
+    .bind(status, Date.now(), examId).run()
 
-  return c.json({ id: questionId, status })
+  return c.json({ id: examId, status })
 })
 
 // ---------- 提交与批改路由（在线批改与学情分析系统） ----------
-// 提交答案（文本 Markdown 和/或 PDF 答卷附件；重交 = 覆盖内容/附件、状态打回 pending、旧批改作废）
-app.post('/api/questions/:id/submit', async (c) => {
+// 提交答卷（仅 PDF 答题卡；重交 = 覆盖附件、状态打回 pending、旧批改作废）
+app.post('/api/exams/:id/submit', async (c) => {
   const userId = c.get('userId')
-  const questionId = c.req.param('id')
-  if (!/^[0-9a-f-]{36}$/.test(questionId)) {
-    return c.json({ error: 'Invalid question ID format' }, 400)
+  const examId = c.req.param('id')
+  if (!/^[0-9a-f-]{36}$/.test(examId)) {
+    return c.json({ error: 'Invalid exam ID format' }, 400)
   }
 
-  const question = await c.env.DB.prepare('SELECT id, status FROM questions WHERE id = ?').bind(questionId).first()
-  if (!question) {
-    return c.json({ error: 'Question not found' }, 404)
+  const exam = await c.env.DB.prepare('SELECT id, status FROM exams WHERE id = ?').bind(examId).first()
+  if (!exam) {
+    return c.json({ error: 'Exam not found' }, 404)
   }
-  // 草稿/已下线题目不接受新提交（已有提交不受影响）
-  if (question.status !== 'published') {
-    return c.json({ error: 'Question is not published' }, 403)
+  // 草稿/已下线联考不接受新提交（已有提交不受影响）
+  if (exam.status !== 'published') {
+    return c.json({ error: 'Exam is not published' }, 403)
   }
 
   const formData = await c.req.formData()
-  const content = formData.get('content')?.toString().trim() || ''
   const file = formData.get('file')
-
-  if (!content && !file) {
-    return c.json({ error: '答案内容不能为空' }, 400)
+  if (!file || !(file instanceof File)) {
+    return c.json({ error: '请上传 PDF 答卷' }, 400)
+  }
+  // 联考答卷仅支持 PDF（前端 FileDropZone 同样限制，这里兜底）
+  if (!file.name.toLowerCase().endsWith('.pdf')) {
+    return c.json({ error: '答卷附件仅支持 PDF' }, 400)
   }
 
   let attachmentUrl = null
   let attachmentName = null
-  if (file) {
-    try {
-      const { buffer, fileName } = await validateUploadedFile(file, c.env)
-      // 答卷附件仅支持 PDF（前端 FileDropZone 同样限制，这里兜底）
-      if (!fileName.toLowerCase().endsWith('.pdf')) {
-        return c.json({ error: '答卷附件仅支持 PDF' }, 400)
-      }
-      const uploadResult = await uploadFileToHF(buffer, fileName, userId, c.env)
-      attachmentUrl = uploadResult.url
-      attachmentName = uploadResult.fileName
-    } catch (err) {
-      return c.json({ error: err.message }, 400)
-    }
+  try {
+    const { buffer, fileName } = await validateUploadedFile(file, c.env)
+    const uploadResult = await uploadFileToHF(buffer, fileName, userId, c.env)
+    attachmentUrl = uploadResult.url
+    attachmentName = uploadResult.fileName
+  } catch (err) {
+    return c.json({ error: err.message }, 400)
   }
 
   const now = Date.now()
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO submissions (id, user_id, question_id, content, attachment_url, attachment_name, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-       ON CONFLICT (user_id, question_id) DO UPDATE SET
-         content = excluded.content,
+      `INSERT INTO submissions (id, user_id, exam_id, content, attachment_url, attachment_name, status, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, ?, 'pending', ?, ?)
+       ON CONFLICT (user_id, exam_id) DO UPDATE SET
          attachment_url = excluded.attachment_url,
          attachment_name = excluded.attachment_name,
          status = 'pending',
          updated_at = excluded.updated_at`
-    ).bind(crypto.randomUUID(), userId, questionId, content || null, attachmentUrl, attachmentName, now, now),
+    ).bind(crypto.randomUUID(), userId, examId, attachmentUrl, attachmentName, now, now),
     c.env.DB.prepare(
-      'DELETE FROM grades WHERE submission_id IN (SELECT id FROM submissions WHERE user_id = ? AND question_id = ?)'
-    ).bind(userId, questionId),
+      'DELETE FROM grades WHERE submission_id IN (SELECT id FROM submissions WHERE user_id = ? AND exam_id = ?)'
+    ).bind(userId, examId),
   ])
 
   // 重交时行已存在，以库内实际 id / created_at 为准
   const row = await c.env.DB.prepare(
-    'SELECT id, created_at FROM submissions WHERE user_id = ? AND question_id = ?'
-  ).bind(userId, questionId).first()
+    'SELECT id, created_at FROM submissions WHERE user_id = ? AND exam_id = ?'
+  ).bind(userId, examId).first()
 
   return c.json({
     id: row.id,
-    question_id: questionId,
-    content: content || null,
+    exam_id: examId,
+    content: null,
     attachment_url: attachmentUrl,
     attachment_name: attachmentName,
     status: 'pending',
@@ -1034,19 +1107,19 @@ app.post('/api/questions/:id/submit', async (c) => {
   }, 201)
 })
 
-// 我在该题下的提交（含批改结果；未提交时 submission 为 null）
-app.get('/api/questions/:id/submission', async (c) => {
+// 我在该联考下的提交（含批改结果；未提交时 submission 为 null）
+app.get('/api/exams/:id/submission', async (c) => {
   const userId = c.get('userId')
-  const questionId = c.req.param('id')
-  if (!/^[0-9a-f-]{36}$/.test(questionId)) {
-    return c.json({ error: 'Invalid question ID format' }, 400)
+  const examId = c.req.param('id')
+  if (!/^[0-9a-f-]{36}$/.test(examId)) {
+    return c.json({ error: 'Invalid exam ID format' }, 400)
   }
 
   const sub = await c.env.DB.prepare(
     `SELECT id, content, attachment_url, attachment_name, status,
             created_at / 1000 AS created_at, updated_at / 1000 AS updated_at
-     FROM submissions WHERE user_id = ? AND question_id = ?`
-  ).bind(userId, questionId).first()
+     FROM submissions WHERE user_id = ? AND exam_id = ?`
+  ).bind(userId, examId).first()
 
   if (!sub) {
     return c.json({ submission: null })
@@ -1059,7 +1132,7 @@ app.get('/api/questions/:id/submission', async (c) => {
   return c.json({
     submission: {
       ...sub,
-      question_id: questionId,
+      exam_id: examId,
       grade: grade || null,
     },
   })
@@ -1073,11 +1146,11 @@ app.get('/api/me/submissions', async (c) => {
   const offset = (page - 1) * limit
 
   const stmt = c.env.DB.prepare(
-    `SELECT s.id, s.question_id, q.title AS question_title, s.status,
+    `SELECT s.id, s.exam_id, e.title AS exam_title, s.status,
             s.created_at / 1000 AS created_at, s.updated_at / 1000 AS updated_at,
             g.score, g.comment, g.created_at / 1000 AS graded_at
      FROM submissions s
-     LEFT JOIN questions q ON q.id = s.question_id
+     LEFT JOIN exams e ON e.id = s.exam_id
      LEFT JOIN grades g ON g.submission_id = s.id
      WHERE s.user_id = ?
      ORDER BY s.created_at DESC LIMIT ? OFFSET ?`
@@ -1106,13 +1179,13 @@ app.get('/api/admin/submissions/pending', async (c) => {
   const order = status === 'pending' ? 'ASC' : 'DESC'
 
   const stmt = c.env.DB.prepare(
-    `SELECT s.id, s.user_id, u.username, s.question_id, q.title AS question_title,
+    `SELECT s.id, s.user_id, u.username, s.exam_id, e.title AS exam_title,
             s.content, s.attachment_url, s.attachment_name, s.status,
             s.created_at / 1000 AS created_at, s.updated_at / 1000 AS updated_at,
             g.id AS grade_id, g.grader_id, g.score, g.comment, g.created_at / 1000 AS graded_at
      FROM submissions s
      JOIN users u ON u.id = s.user_id
-     LEFT JOIN questions q ON q.id = s.question_id
+     LEFT JOIN exams e ON e.id = s.exam_id
      LEFT JOIN grades g ON g.submission_id = s.id
      WHERE s.status = ?
      ORDER BY s.created_at ${order} LIMIT ? OFFSET ?`
@@ -1194,7 +1267,7 @@ app.post('/api/admin/submissions/:id/grade', async (c) => {
   })
 })
 
-// 管理员全局统计看板（KPI、分数分布、题目难度、14 天趋势）
+// 管理员全局统计看板（KPI、分数分布、联考难度、14 天趋势）
 app.get('/api/admin/statistics/overview', async (c) => {
   if (!requireAdmin(c)) return
 
@@ -1215,11 +1288,11 @@ app.get('/api/admin/statistics/overview', async (c) => {
   ).all()).results || []
 
   const diffRows = (await c.env.DB.prepare(
-    `SELECT s.question_id, q.title, ROUND(AVG(g.score), 1) AS avg_score, COUNT(g.id) AS graded_count
+    `SELECT s.exam_id, e.title, ROUND(AVG(g.score), 1) AS avg_score, COUNT(g.id) AS graded_count
      FROM submissions s
      JOIN grades g ON g.submission_id = s.id
-     JOIN questions q ON q.id = s.question_id
-     GROUP BY s.question_id, q.title
+     JOIN exams e ON e.id = s.exam_id
+     GROUP BY s.exam_id, e.title
      ORDER BY avg_score ASC`
   ).all()).results || []
 
@@ -1263,12 +1336,12 @@ app.get('/api/admin/statistics/overview', async (c) => {
       students: kpiRow.students,
     },
     score_distribution,
-    question_difficulty: diffRows,
+    exam_difficulty: diffRows,
     trend,
   })
 })
 
-// 学生个人学情（平均分对比、各题得失、近 10 次成绩）
+// 学生个人学情（平均分对比、各场联考得失、近 10 次成绩）
 app.get('/api/me/statistics', async (c) => {
   const userId = c.get('userId')
 
@@ -1283,23 +1356,23 @@ app.get('/api/me/statistics', async (c) => {
     'SELECT COUNT(*) AS total FROM submissions WHERE user_id = ?'
   ).bind(userId).first()
 
-  const perQuestion = (await c.env.DB.prepare(
-    `SELECT s.question_id, q.title, g.score,
+  const perExam = (await c.env.DB.prepare(
+    `SELECT s.exam_id, e.title, g.score,
             (SELECT ROUND(AVG(g2.score), 1) FROM grades g2
               JOIN submissions s2 ON g2.submission_id = s2.id
-             WHERE s2.question_id = s.question_id) AS global_avg
+             WHERE s2.exam_id = s.exam_id) AS global_avg
      FROM submissions s
      JOIN grades g ON g.submission_id = s.id
-     LEFT JOIN questions q ON q.id = s.question_id
+     LEFT JOIN exams e ON e.id = s.exam_id
      WHERE s.user_id = ?
      ORDER BY s.created_at DESC`
   ).bind(userId).all()).results || []
 
   const lastGrades = (await c.env.DB.prepare(
-    `SELECT s.question_id, q.title, g.score, g.created_at / 1000 AS created_at
+    `SELECT s.exam_id, e.title, g.score, g.created_at / 1000 AS created_at
      FROM grades g
      JOIN submissions s ON g.submission_id = s.id
-     LEFT JOIN questions q ON q.id = s.question_id
+     LEFT JOIN exams e ON e.id = s.exam_id
      WHERE s.user_id = ?
      ORDER BY g.created_at DESC LIMIT 10`
   ).bind(userId).all()).results || []
@@ -1313,7 +1386,7 @@ app.get('/api/me/statistics', async (c) => {
       graded_count: myAvgRow.graded_count,
       total_submissions: totalRow.total,
     },
-    per_question: perQuestion,
+    per_exam: perExam,
     last_grades: lastGrades,
   })
 })
