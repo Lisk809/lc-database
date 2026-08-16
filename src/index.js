@@ -100,16 +100,20 @@ async function md5(message) {
   const hashArray = Array.from(new Uint8Array(hashBuffer))
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
 }
-// ---------- 徽章授予（示例：根据条件自动授予，这里简单实现） ----------
-async function awardBadgeIfNotExists(userId, badgeId, env) {
-  const existing = await env.DB.prepare(
-    'SELECT 1 FROM user_badges WHERE user_id = ? AND badge_id = ?'
-  ).bind(userId, badgeId).first();
-  if (existing) return;
-  const now = Date.now();
-  await env.DB.prepare(
-    'INSERT INTO user_badges (user_id, badge_id, awarded_at) VALUES (?, ?, ?)'
-  ).bind(userId, badgeId, now).run();
+// ---------- 徽章 ----------
+// 徽章存于 users.badges（JSON 数组，元素为徽章 ID），徽章元数据在此处定义
+const BADGE_DEFS = {
+  'official-team': { name: '官方团队', description: 'Lunacho 官方团队成员', icon_url: null },
+}
+
+function parseBadgeIds(raw) {
+  if (!raw) return []
+  try {
+    const arr = JSON.parse(raw)
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []
+  } catch {
+    return []
+  }
 }
 // 生成 Gravatar URL
 async function getGravatarUrl(email, size = 200) {
@@ -380,17 +384,14 @@ app.post('/api/auth/login', async (c) => {
 app.get('/api/me', async (c) => {
   const userId = c.get('userId');
   const user = await c.env.DB.prepare(
-    'SELECT id, username, email, bio, created_at FROM users WHERE id = ?'
+    'SELECT id, username, email, bio, created_at, badges FROM users WHERE id = ?'
   ).bind(userId).first();
   if (!user) return c.json({ error: 'User not found' }, 404);
 
-  // 获取用户徽章
-  const badges = await c.env.DB.prepare(
-    `SELECT b.id, b.name, b.description, b.icon_url, ub.awarded_at
-     FROM user_badges ub
-     JOIN badges b ON ub.badge_id = b.id
-     WHERE ub.user_id = ? ORDER BY ub.awarded_at DESC`
-  ).bind(userId).all();
+  // 徽章：users.badges 存徽章 ID 的 JSON 数组，按 BADGE_DEFS 映射为展示信息
+  const badges = parseBadgeIds(user.badges)
+    .map((id) => (BADGE_DEFS[id] ? { id, ...BADGE_DEFS[id], awarded_at: user.created_at } : null))
+    .filter(Boolean)
 
   // 头像统一使用 Gravatar（由注册邮箱决定），不再支持自定义头像上传
   const avatar = await getGravatarUrl(user.email);
@@ -402,7 +403,7 @@ app.get('/api/me', async (c) => {
     bio: user.bio || '',
     created_at: Math.floor(user.created_at / 1000),
     is_admin: getAdminIds(c.env).includes(userId),
-    badges: (badges.results || []).map((b) => ({ ...b, awarded_at: Math.floor(b.awarded_at / 1000) })),
+    badges: badges.map((b) => ({ ...b, awarded_at: Math.floor(b.awarded_at / 1000) })),
   });
 });
 // 更新个人信息（仅 bio；头像由 Gravatar 提供，不接受自定义）
