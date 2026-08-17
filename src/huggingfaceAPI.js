@@ -18,6 +18,8 @@ export class HuggingFaceAPI {
         this.repo = repo;  // 格式: username/repo-name
         this.isPrivate = isPrivate;
         this.baseURL = 'https://huggingface.co';
+        // 下载链接走国内镜像（镜像不支持上传/API 写入，仅替换 resolve 下载地址）
+        this.downloadBaseURL = 'https://hf-mirror.com';
     }
 
     /**
@@ -405,7 +407,7 @@ export class HuggingFaceAPI {
                 await this.commitDirectFile(filePath, file, commitMessage);
             }
 
-            const fileUrl = `${this.baseURL}/datasets/${this.repo}/resolve/main/${filePath}`;
+            const fileUrl = `${this.downloadBaseURL}/datasets/${this.repo}/resolve/main/${filePath}`;
             return {
                 success: true,
                 filePath,
@@ -515,7 +517,7 @@ export class HuggingFaceAPI {
      * 获取文件 URL
      */
     getFileURL(filePath) {
-        return `${this.baseURL}/datasets/${this.repo}/resolve/main/${filePath}`;
+        return `${this.downloadBaseURL}/datasets/${this.repo}/resolve/main/${filePath}`;
     }
 
     static getMetadataFileSize(metadata = {}) {
