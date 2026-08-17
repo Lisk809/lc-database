@@ -66,16 +66,22 @@ async function verifyPassword(password, hash, salt) {
   const computedHash = await hashPassword(password, salt)
   return computedHash === hash
 }
-// ---------- 管理员名单 ----------
-// 管理员人数少、身份单一：直接读 Secret（ADMIN_USER_IDS，逗号分隔的用户 ID），
-// 不在数据库里维护管理员标记
-function getAdminIds(env) {
-  return (env.ADMIN_USER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean)
+// ---------- 管理员判定 ----------
+// 管理员身份存于数据库（users.is_admin），不再使用 Secret 名单；
+// 每次请求首次查询后缓存在 context 上，避免同一请求内重复查库
+async function isAdmin(c) {
+  const userId = c.get('userId')
+  if (!userId || userId === 'anonymous') return false
+  const cached = c.get('isAdmin')
+  if (typeof cached === 'boolean') return cached
+  const row = await c.env.DB.prepare('SELECT is_admin FROM users WHERE id = ?').bind(userId).first()
+  const result = !!row?.is_admin
+  c.set('isAdmin', result)
+  return result
 }
 // 管理员权限校验：无权限时已回 403 并返回 false，调用处直接 return
-function requireAdmin(c) {
-  const userId = c.get('userId')
-  if (!getAdminIds(c.env).includes(userId)) {
+async function requireAdmin(c) {
+  if (!(await isAdmin(c))) {
     c.json({ error: 'Forbidden' }, 403)
     return false
   }
@@ -266,7 +272,7 @@ app.use('/api/*', async (c, next) => {
   const limiter = c.env.RATE_LIMITER
   // 如果限流器未绑定，跳过限流（避免报错）
   // 管理员豁免：批改工作台连续翻队列、打分会快速超过 20 次/分钟
-  if (limiter && !getAdminIds(c.env).includes(userId)) {
+  if (limiter && !(await isAdmin(c))) {
     const { success } = await limiter.limit({
       key: userId,
       limit: 20,
@@ -383,7 +389,7 @@ app.post('/api/auth/login', async (c) => {
 app.get('/api/me', async (c) => {
   const userId = c.get('userId');
   const user = await c.env.DB.prepare(
-    'SELECT id, username, email, bio, created_at, badges FROM users WHERE id = ?'
+    'SELECT id, username, email, bio, created_at, badges, is_admin FROM users WHERE id = ?'
   ).bind(userId).first();
   if (!user) return c.json({ error: 'User not found' }, 404);
 
@@ -401,7 +407,7 @@ app.get('/api/me', async (c) => {
     avatar,
     bio: user.bio || '',
     created_at: Math.floor(user.created_at / 1000),
-    is_admin: getAdminIds(c.env).includes(userId),
+    is_admin: !!user.is_admin,
     badges: badges.map((b) => ({ ...b, awarded_at: Math.floor(b.awarded_at / 1000) })),
   });
 });
@@ -512,10 +518,8 @@ app.get('/api/announcements', async (c) => {
 // 发布公告（仅管理员）
 app.post('/api/announcements', async (c) => {
   const userId = c.get('userId');
-  // 检查管理员权限：名单来自 Secret（ADMIN_USER_IDS），见 getAdminIds
-  if (!getAdminIds(c.env).includes(userId)) {
-    return c.json({ error: 'Forbidden' }, 403);
-  }
+  // 检查管理员权限：身份存于数据库（users.is_admin），见 isAdmin
+  if (!(await requireAdmin(c))) return;
 
   const { title, content } = await c.req.json();
   if (!title || !content) {
@@ -916,7 +920,7 @@ app.get('/api/questions', async (c) => {
 // ---------- 联考（试卷 + 答题卡 PDF，仅管理员创建；仅联考有提交/批改） ----------
 // 创建联考（试卷与答题卡均为必传 PDF）
 app.post('/api/exams', async (c) => {
-  if (!requireAdmin(c)) return
+  if (!(await requireAdmin(c))) return
   const userId = c.get('userId')
   const formData = await c.req.formData()
   const title = formData.get('title')?.toString().trim() || ''
@@ -976,24 +980,24 @@ app.get('/api/exams', async (c) => {
   const page = parseInt(c.req.query('page') || '1')
   const limit = Math.min(parseInt(c.req.query('limit') || '10'), 50)
   const offset = (page - 1) * limit
-  const isAdmin = getAdminIds(c.env).includes(c.get('userId'))
+  const isAdminUser = await isAdmin(c)
 
   const stmt = c.env.DB.prepare(
     `SELECT id, title, description, paper_url, paper_name, sheet_url, sheet_name, status,
             created_at / 1000 AS created_at
      FROM exams
-     ${isAdmin ? '' : 'WHERE status = ?'}
+     ${isAdminUser ? '' : 'WHERE status = ?'}
      ORDER BY created_at DESC LIMIT ? OFFSET ?`
   )
-  const rows = isAdmin
+  const rows = isAdminUser
     ? await stmt.bind(limit, offset).all()
     : await stmt.bind('published', limit, offset).all()
   const totalStmt = c.env.DB.prepare(
-    isAdmin
+    isAdminUser
       ? 'SELECT COUNT(*) as total FROM exams'
       : 'SELECT COUNT(*) as total FROM exams WHERE status = ?'
   )
-  const total = isAdmin
+  const total = isAdminUser
     ? (await totalStmt.first()).total
     : (await totalStmt.bind('published').first()).total
 
@@ -1005,7 +1009,7 @@ app.get('/api/exams', async (c) => {
 
 // 发布/下线联考（管理员）：draft 仅管理员可见且不可提交；published 全站可见
 app.patch('/api/exams/:id/status', async (c) => {
-  if (!requireAdmin(c)) return
+  if (!(await requireAdmin(c))) return
 
   const examId = c.req.param('id')
   if (!/^[0-9a-f-]{36}$/.test(examId)) {
@@ -1167,7 +1171,7 @@ app.get('/api/me/submissions', async (c) => {
 
 // 管理员批改队列（pending 升序 FIFO；graded 降序便于复查；分页）
 app.get('/api/admin/submissions/pending', async (c) => {
-  if (!requireAdmin(c)) return
+  if (!(await requireAdmin(c))) return
 
   const status = c.req.query('status') || 'pending'
   if (!['pending', 'graded'].includes(status)) {
@@ -1212,7 +1216,7 @@ app.get('/api/admin/submissions/pending', async (c) => {
 
 // 提交批改结果（覆盖式更新，批改后状态置为 graded）
 app.post('/api/admin/submissions/:id/grade', async (c) => {
-  if (!requireAdmin(c)) return
+  if (!(await requireAdmin(c))) return
 
   const submissionId = c.req.param('id')
   if (!/^[0-9a-f-]{36}$/.test(submissionId)) {
@@ -1269,7 +1273,7 @@ app.post('/api/admin/submissions/:id/grade', async (c) => {
 
 // 管理员全局统计看板（KPI、分数分布、联考难度、14 天趋势）
 app.get('/api/admin/statistics/overview', async (c) => {
-  if (!requireAdmin(c)) return
+  if (!(await requireAdmin(c))) return
 
   const kpiRow = await c.env.DB.prepare(
     `SELECT COUNT(*) AS total,
