@@ -15,7 +15,6 @@ const ALLOWED_MIME_TYPES = new Set([
   'image/jpeg',
   'application/pdf'
 ])
-
 // ---------- 创建 Hono 应用 ----------
 const app = new Hono()
 // ---------- 辅助函数 ----------
@@ -236,7 +235,7 @@ app.use('*', async (c, next) => {
 })
 
 app.use('/api/*', async (c, next) => {
-  if (c.req.path.startsWith('/api/auth/')) {
+  if (c.method=="GET" && !c.req.path.startsWith("/api/me")) {
     await next()
     return
   }
