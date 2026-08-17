@@ -516,12 +516,11 @@ app.get('/api/announcements', async (c) => {
 });
 
 // 发布公告（仅管理员）
-app.post('/api/announcements', async (c, next) => {
+app.post('/api/announcements', async (c) => {
   const userId = c.get('userId');
   // 检查管理员权限：身份存于数据库（users.is_admin），见 isAdmin
   if (!(await requireAdmin(c))){
-    await next()
-    return;
+    return c.json({error: "Forbidden"}, 403);
   }
 
   const { title, content } = await c.req.json();
