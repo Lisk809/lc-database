@@ -235,7 +235,7 @@ app.use('*', async (c, next) => {
 })
 
 app.use('/api/*', async (c, next) => {
-  if (c.method=="GET" && !c.req.path.startsWith("/api/me") && c.req.path.startsWith("/api/auth")) {
+  if (c.method=="GET" || !c.req.path.startsWith("/api/me") || c.req.path.startsWith("/api/auth")) {
     await next()
     return
   }
