@@ -16,7 +16,8 @@ const ALLOWED_MIME_TYPES = new Set([
   'application/pdf'
 ])
 // ---------- 创建 Hono 应用 ----------
-const app = new Hono()
+// strict: false —— /api/announcements 与 /api/announcements/ 视为同一路由（默认严格匹配会 404）
+const app = new Hono({ strict: false })
 // ---------- 辅助函数 ----------
 // ---------- 密码哈希工具（基于 Web Crypto API） ----------
 async function hashPassword(password, salt) {
@@ -81,11 +82,7 @@ async function isAdmin(c) {
 }
 // 管理员权限校验：无权限时已回 403 并返回 false，调用处直接 return
 async function requireAdmin(c) {
-  if (!(await isAdmin(c))) {
-    c.json({ error: 'Forbidden' }, 403)
-    return false
-  }
-  return true
+  return !!(await isAdmin(c))
 }
 // ---------- Turnstile 人机验证 ----------
 async function verifyTurnstile(token, secret) {
@@ -241,24 +238,25 @@ app.use('*', async (c, next) => {
 })
 
 app.use('/api/*', async (c, next) => {
-  if (c.method=="GET" || !c.req.path.startsWith("/api/me") || c.req.path.startsWith("/api/auth")) {
-    await next()
-    return
-  }
+  // 可选认证：带了有效 token 就解析出 userId（GET 公开接口也认管理员）；
+  // 非 GET 请求必须有有效 token，/api/auth 登录注册除外
   const authHeader = c.req.header('Authorization')
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const payload = await verify(authHeader.slice(7), c.env.JWT_SECRET, 'HS256')
+      c.set('jwtPayload', payload)
+      c.set('userId', payload.sub)
+    } catch (err) {
+      if (c.req.method !== 'GET') {
+        console.error('Verify error:', err)
+        return c.json({ error: 'Unauthorized', detail: err.message }, 401)
+      }
+      // GET 请求 token 无效时降级为匿名访问
+    }
+  } else if (c.req.method !== 'GET' && !c.req.path.startsWith('/api/auth')) {
     return c.json({ error: 'Missing or invalid Authorization header' }, 401)
   }
-  const token = authHeader.slice(7)
-  try {
-    const payload = await verify(token, c.env.JWT_SECRET,"HS256")
-    c.set('jwtPayload', payload)
-    c.set('userId', payload.sub)
-    await next()
-  } catch (err) {
-    console.error('Verify error:', err)
-    return c.json({ error: 'Unauthorized', detail: err.message, token }, 401)
-  }
+  await next()
 })
 // 4. 限流中间件（基于 userId，公开路径用 'anonymous'）
 app.use('/api/*', async (c, next) => {
@@ -519,9 +517,7 @@ app.get('/api/announcements', async (c) => {
 app.post('/api/announcements', async (c) => {
   const userId = c.get('userId');
   // 检查管理员权限：身份存于数据库（users.is_admin），见 isAdmin
-  if (!(await requireAdmin(c))){
-    return c.json({error: "Forbidden"}, 403);
-  }
+  if (!(await requireAdmin(c))) return c.json({ error: 'Forbidden' }, 403)
 
   const { title, content } = await c.req.json();
   if (!title || !content) {
@@ -922,7 +918,7 @@ app.get('/api/questions', async (c) => {
 // ---------- 联考（试卷 + 答题卡 PDF，仅管理员创建；仅联考有提交/批改） ----------
 // 创建联考（试卷与答题卡均为必传 PDF）
 app.post('/api/exams', async (c) => {
-  if (!(await requireAdmin(c))) return
+  if (!(await requireAdmin(c))) return c.json({ error: 'Forbidden' }, 403)
   const userId = c.get('userId')
   const formData = await c.req.formData()
   const title = formData.get('title')?.toString().trim() || ''
@@ -1011,7 +1007,7 @@ app.get('/api/exams', async (c) => {
 
 // 发布/下线联考（管理员）：draft 仅管理员可见且不可提交；published 全站可见
 app.patch('/api/exams/:id/status', async (c) => {
-  if (!(await requireAdmin(c))) return
+  if (!(await requireAdmin(c))) return c.json({ error: 'Forbidden' }, 403)
 
   const examId = c.req.param('id')
   if (!/^[0-9a-f-]{36}$/.test(examId)) {
@@ -1173,7 +1169,7 @@ app.get('/api/me/submissions', async (c) => {
 
 // 管理员批改队列（pending 升序 FIFO；graded 降序便于复查；分页）
 app.get('/api/admin/submissions/pending', async (c) => {
-  if (!(await requireAdmin(c))) return
+  if (!(await requireAdmin(c))) return c.json({ error: 'Forbidden' }, 403)
 
   const status = c.req.query('status') || 'pending'
   if (!['pending', 'graded'].includes(status)) {
@@ -1218,7 +1214,7 @@ app.get('/api/admin/submissions/pending', async (c) => {
 
 // 提交批改结果（覆盖式更新，批改后状态置为 graded）
 app.post('/api/admin/submissions/:id/grade', async (c) => {
-  if (!(await requireAdmin(c))) return
+  if (!(await requireAdmin(c))) return c.json({ error: 'Forbidden' }, 403)
 
   const submissionId = c.req.param('id')
   if (!/^[0-9a-f-]{36}$/.test(submissionId)) {
@@ -1275,7 +1271,7 @@ app.post('/api/admin/submissions/:id/grade', async (c) => {
 
 // 管理员全局统计看板（KPI、分数分布、联考难度、14 天趋势）
 app.get('/api/admin/statistics/overview', async (c) => {
-  if (!(await requireAdmin(c))) return
+  if (!(await requireAdmin(c))) return c.json({ error: 'Forbidden' }, 403)
 
   const kpiRow = await c.env.DB.prepare(
     `SELECT COUNT(*) AS total,
