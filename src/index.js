@@ -516,10 +516,13 @@ app.get('/api/announcements', async (c) => {
 });
 
 // 发布公告（仅管理员）
-app.post('/api/announcements', async (c) => {
+app.post('/api/announcements', async (c, next) => {
   const userId = c.get('userId');
   // 检查管理员权限：身份存于数据库（users.is_admin），见 isAdmin
-  if (!(await requireAdmin(c))) return;
+  if (!(await requireAdmin(c))){
+    await next()
+    return;
+  }
 
   const { title, content } = await c.req.json();
   if (!title || !content) {
